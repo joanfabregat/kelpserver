@@ -2,7 +2,7 @@
 
 # ADR 0001: Native clients, independent panes and device capabilities
 
-- Status: Proposed. The native stream foundation is experimental; the full contract is not frozen.
+- Status: Proposed; the server/UI boundary is superseded by [ADR 0002](0002-generic-session-server.md). The native stream foundation is experimental; the full contract is not frozen.
 - Date: 2026-10-14 (America/Los_Angeles).
 - Updated: 2026-10-17 (America/Los_Angeles), client-approved SSH execution requests.
 - Scope: Native Kelpmux. tmux compatibility remains an independent optional adapter.
