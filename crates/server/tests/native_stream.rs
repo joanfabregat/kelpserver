@@ -134,7 +134,7 @@ impl Peer {
                     assert_eq!(owner, self.id);
                     break;
                 }
-                Event::Error { message } => panic!("{message}"),
+                Event::Error { message, .. } => panic!("{message}"),
                 _ => {}
             }
         }
@@ -142,7 +142,7 @@ impl Peer {
     fn error(&mut self, r: Request) -> String {
         self.send(r);
         loop {
-            if let Event::Error { message } = self.next() {
+            if let Event::Error { message, .. } = self.next() {
                 return message;
             }
         }

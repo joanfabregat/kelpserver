@@ -546,3 +546,37 @@ fn bridge_reports_a_workspace_that_speaks_only_legacy_tui_messages() {
     assert!(error.contains("native stream protocol"), "{error}");
     peer.join().unwrap();
 }
+#[test]
+fn bridge_relays_session_api_requests_and_opt_in_events() {
+    let server = Server::start();
+    let mut bridge = Bridge::start(&server);
+    bridge.hello(false);
+    bridge.send(Request::SessionEvents { enabled: true });
+    bridge.send(Request::Spawn {
+        request: "bridge-1".into(),
+        cwd: None,
+        argv: vec![],
+    });
+    let mut created = None;
+    let mut spawned = None;
+    while spawned.is_none() {
+        let message = bridge
+            .events
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bridge response timeout")
+            .unwrap();
+        match message {
+            ServerMessage::Stream(Event::PaneCreated { session }) => created = Some(session.pane),
+            ServerMessage::Stream(Event::Spawned { request, pane }) => {
+                assert_eq!(request, "bridge-1");
+                spawned = Some(pane);
+            }
+            ServerMessage::Stream(Event::Error { message, .. }) => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(created, spawned);
+    assert!(bridge.finish().success());
+}

@@ -1,6 +1,6 @@
 # ADR 0002: KelpServer is a generic session server
 
-- Status: Accepted by Joan 2026-11-20 (America/Los_Angeles). Not implemented.
+- Status: Accepted by Joan 2026-11-20 (America/Los_Angeles). Step 1 implemented; steps 2–4 not started.
 - Related: [ADR 0001](0001-native-client-protocol-and-device-capabilities.md), KelpMux [ADR 0003 (web client)](https://github.com/joanfabregat/kelpmux/blob/main/docs/adr/0003-web-client-in-kelpmux.md), KelpHub ADR 0007 (multi-tenant, Kubernetes-only; private repository).
 
 ## Context
@@ -40,5 +40,20 @@ The tab behavior merged in [kelpserver#1](https://github.com/joanfabregat/kelpse
 
 ## Open points
 
+Both points were decided during step 1; see [Implementation notes](#implementation-notes).
+
 - Exact split of `server.rs`, `status.rs` (host vitals) and `discovery.rs` (agent and tmux discovery) between the two sides; decided during step 1 by the boundary rule.
 - Whether closed-session records stay generic or become client-owned.
+
+## Implementation notes
+
+### Step 1: session API (2026-11-20)
+
+The pane stream now carries the session API: pane lifecycle events and per-pane session data, `spawn` and `close`, closed-session records (`closed_sessions`, `restore`), history and multi-pane search, lease-bound scrolling, `acknowledge_all`, opt-in host status, `shutdown` and `server_stopping`, and the server version in Welcome. Everything is additive and capability-gated; the stream stays at version 1, events of new types reach only connections that opted in or sent the request, and protocol 58 is unchanged. The contract is in [native-client-protocol.md](../native-client-protocol.md#session-api); the capability inventory, the decisions and the gaps left for step 2 are in [session-api.md](../session-api.md). No UI code moved and the server stores no new client UI state.
+
+Parking needs no server concept: a client unsubscribes from a hidden pane and keeps its lease (fixed size) or releases it (base geometry). The scratch terminal is an ordinary pane created with `spawn`. Tab order can default to pane ID order, which is creation order within an epoch.
+
+The open points were decided by the boundary rule:
+
+- **`server.rs`, `status.rs` and `discovery.rs`.** `discovery.rs` (Claude/Codex agent discovery and polling) produces pane observations shared by every client and stays. `status.rs` splits: host sampling (`Monitor`, `Snapshot`, `Process`, `Disk`) stays and is exposed by `host-status`; its presentation (`View`, `Sort`, column and layout helpers, formatting) moves to KelpMux with the Status dialog in step 2. `server.rs` keeps PTYs, the stream and its leases, spawn/close/restore, discovery, history and activity; composed-frame production, `mouse`, the `Action` handling, the TUI controller and theme fallback, title animation, unused-shell hints and the UI parts of `persist_geometry` leave in step 3, after the TUI no longer needs them.
+- **Closed-session records stay in the server and stay generic.** They are derived from server observations (foreground programs, agent sessions), are useful to KelpMux and KelpHub alike, and are addressed by an opaque `key`; only their presentation (restore-choice labels, copying the resume command) is client UI.

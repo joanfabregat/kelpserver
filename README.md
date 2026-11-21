@@ -17,7 +17,7 @@ The package names are historical and kept so that existing consumers need no sou
 
 KelpServer has no dependency on any client. Its clients are:
 
-- **KelpMux TUI** (the `kelpmux` executable): attaches over the composed-screen local protocol and launches or reuses the standalone `kelpserver` daemon.
+- **KelpMux TUI** (the `kelpmux` executable): attaches over the composed-screen local protocol and launches or reuses the standalone `kelpserver` daemon. Per [ADR 0002](crates/server/docs/adr/0002-generic-session-server.md) it is moving to the pane stream with local rendering and local UI state; the stream's session API (step 1) is in place.
 - **KelpMux web client** (`kelpmux web-relay` / `kelpmux web-bridge`) and the **KelpClient** Rust/WASM core: use the independent pane stream and the generic relay in this repository; browser assets are supplied by the consumer.
 - **KelpHub**: uses the library and the pane stream behind its own authenticated management adapter. Project, Git, upload and management features stay in KelpHub; KelpServer is not a project manager, credential broker or container orchestrator.
 
@@ -26,7 +26,7 @@ The contract consists of:
 | Surface | Version | Stability |
 | --- | --- | --- |
 | Local composed-screen protocol (TUI ↔ server, same-user Unix socket) | `LOCAL_PROTOCOL_VERSION = 58` | A matching TUI/server pair is required: mouse routing shares UI geometry and dialog types. Clients check the peer's protocol before attaching. |
-| Independent pane stream (`Stream` hello/welcome, snapshots, patches, leases) | `STREAM_PROTOCOL_VERSION = 1` | Experimental and not yet frozen. Optional features are advertised as Welcome capabilities; clients must not assume undeclared ones. Unsupported versions fail clearly. See [the stream contract](crates/server/docs/native-client-protocol.md). |
+| Independent pane stream (`Stream` hello/welcome, snapshots, patches, leases) and its session API (pane lifecycle, closed-session records, history and search, host status, server lifecycle) | `STREAM_PROTOCOL_VERSION = 1` | Experimental and not yet frozen. Optional features are advertised as Welcome capabilities; clients must not assume undeclared ones, and must not send a request whose capability is missing. Events of new types reach only connections that opted in or sent the request, so existing v1 clients are unaffected. Unsupported versions fail clearly. See [the stream contract](crates/server/docs/native-client-protocol.md) and [the session API inventory](crates/server/docs/session-api.md). |
 | Framing | 4-byte big-endian length + UTF-8 JSON, 16 MiB maximum | Shared by the Unix socket and `kelpserver bridge` over SSH. |
 | Rust API of `kelpserver` and `kelpclient-protocol` | crate versions | Pre-1.0 and unstable; consumers pin an exact Git revision. |
 | Executable and state | `kelpserver`, XDG state paths, `KELPMUX_*` environment names | Unchanged by the extraction. |

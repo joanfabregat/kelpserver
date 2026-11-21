@@ -142,6 +142,10 @@ struct NativePane {
     agent_named: bool,
     terminal_title: Option<String>,
     program: Option<super::program_status::Snapshot>,
+    created_at: u64,
+    startup: Option<String>,
+    argv: Vec<String>,
+    exit: Option<(Option<i32>, Option<i32>)>,
 }
 impl NativePane {
     fn spawn(
@@ -236,6 +240,10 @@ impl NativePane {
             agent_named: false,
             terminal_title: None,
             program: None,
+            created_at: crate::now(),
+            startup: startup.map(str::to_owned),
+            argv: Vec::new(),
+            exit: None,
         };
         pane.start = process::read(Path::new("/proc"), pane.child.id())?.start;
         let fd = pane.master.as_raw_fd();
@@ -409,9 +417,12 @@ struct Client {
     writing: Option<(Vec<u8>, usize)>,
     frame: Option<Vec<u8>>,
     queued: usize,
+    failed: bool,
 }
 struct StreamClient {
     clipboard: bool,
+    session_events: bool,
+    host: bool,
     panes: Vec<PaneId>,
     previous: BTreeMap<PaneId, super::stream::PaneSnapshot>,
     metadata: Option<super::stream::Update>,
@@ -466,6 +477,7 @@ impl Client {
             writing: None,
             frame: None,
             queued: 0,
+            failed: false,
         })
     }
     fn send(&mut self, message: ServerMessage) -> Result<()> {
@@ -478,6 +490,9 @@ impl Client {
         Ok(())
     }
     fn flush(&mut self) -> Result<()> {
+        if self.failed {
+            return Err("slow native client".into());
+        }
         // Work per client is bounded so even a permanently writable observer cannot monopolize PTYs.
         for _ in 0..8 {
             if self.writing.is_none() {
@@ -618,6 +633,13 @@ impl Drop for RecoveryJob {
 }
 struct Server {
     spawn_requests: BTreeMap<String, (PaneId, PathBuf, Vec<String>)>,
+    /// Closed-session records last listed for stream clients; `restore` looks
+    /// records up here so it never depends on the composed UI's list indices.
+    records: Vec<super::history::Entry>,
+    /// Stream connections waiting for the running recovery job.
+    recovery_waiters: Vec<(u64, String)>,
+    /// The running recovery job also refreshes the composed UI's lists.
+    recovery_for_ui: bool,
     history: super::history::History,
     reopen_pending: Option<u64>,
     remember_tab_order: bool,
@@ -699,6 +721,123 @@ impl Server {
         }
         Ok(())
     }
+    fn pane_session(&self, id: PaneId) -> Option<super::stream::PaneSession> {
+        let pane = self.panes.get(&id)?;
+        Some(super::stream::PaneSession {
+            pane: id,
+            created_at: pane.created_at,
+            launch_cwd: pane.launch_cwd.to_string_lossy().into_owned(),
+            shell: pane.launch_shell.to_string_lossy().into_owned(),
+            argv: pane.argv.clone(),
+            startup: pane.startup.clone(),
+            terminal_title: pane.terminal_title.clone(),
+        })
+    }
+    /// Deliver a lifecycle event to every connection that opted in. A pending
+    /// replaceable update predates the event, so it is discarded together with
+    /// that connection's baselines; the next update follows the event.
+    fn session_event(&mut self, event: super::stream::Event) {
+        for client in self.clients.values_mut() {
+            let Some(stream) = client.stream.as_mut() else {
+                continue;
+            };
+            if !stream.session_events {
+                continue;
+            }
+            if let Some(old) = client.frame.take() {
+                client.queued = client.queued.saturating_sub(old.len());
+                stream.previous.clear();
+                stream.metadata = None;
+            }
+            // A connection that cannot take a lifecycle event has lost
+            // continuity; the next flush disconnects it. Removing it here
+            // would invalidate callers that still address the requester.
+            if client.send(ServerMessage::Stream(event.clone())).is_err() {
+                client.failed = true;
+            }
+        }
+        self.dirty = true;
+    }
+    fn stop(&mut self, reason: super::stream::StopReason) {
+        if !self.shutdown {
+            self.shutdown = true;
+            self.session_event(super::stream::Event::ServerStopping { reason });
+        }
+    }
+    fn start_recovery(&mut self) {
+        if self.recovery_job.is_some() {
+            return;
+        }
+        let state = self.config.state_dir.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let result = super::recovery::collect_cancellable(&state, &worker_cancel)
+                .map(|agents| (agents, super::history::collect(&state)));
+            let _ = sender.send(result);
+        });
+        self.recovery_job = Some(RecoveryJob {
+            receiver,
+            cancel,
+            worker: Some(worker),
+        });
+    }
+    /// Shared by `SpawnPane` administration and the stream `spawn` request.
+    fn spawn_requested(
+        &mut self,
+        request: &str,
+        cwd: PathBuf,
+        argv: Vec<String>,
+    ) -> Result<PaneId> {
+        if !super::stream::valid_request(request)
+            || !cwd.is_absolute()
+            || argv.len() > 32
+            || argv.iter().map(String::len).sum::<usize>() > 8192
+            || argv.iter().any(|arg| arg.contains('\0'))
+            || argv.first().is_some_and(|arg| arg.is_empty())
+        {
+            return Err("invalid pane creation request".into());
+        }
+        let cwd = cwd.canonicalize()?;
+        if !cwd.is_dir() {
+            return Err("working directory must be a directory".into());
+        }
+        if let Some((pane, previous_cwd, previous_argv)) = self.spawn_requests.get(request) {
+            if previous_cwd != &cwd || previous_argv != &argv {
+                return Err("creation request was already used with different parameters".into());
+            }
+            if !self.panes.contains_key(pane) {
+                return Err("created pane has already closed".into());
+            }
+            return Ok(*pane);
+        }
+        let pane = self.next_pane;
+        let startup = (!argv.is_empty()).then(|| {
+            argv.iter()
+                .map(|arg| crate::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        self.spawn_pane_command(
+            Some(super::templates::TemplatePane {
+                name: "shell".into(),
+                cwd: cwd.clone(),
+                shell: None,
+            }),
+            startup.as_deref(),
+            argv.clone(),
+        )?;
+        self.aliases.remove(&pane);
+        if self.spawn_requests.len() >= 512 {
+            self.spawn_requests.pop_first();
+        }
+        self.spawn_requests
+            .insert(request.to_owned(), (pane, cwd, argv));
+        self.resize();
+        self.dirty = true;
+        Ok(pane)
+    }
     fn stream_request(&mut self, id: u64, request: super::stream::Request) -> Result<()> {
         use super::stream::{Event, Request};
         if let Request::Hello { version } = request {
@@ -711,6 +850,8 @@ impl Server {
             }
             client.stream = Some(StreamClient {
                 clipboard: false,
+                session_events: false,
+                host: false,
                 panes: Vec::new(),
                 previous: BTreeMap::new(),
                 metadata: None,
@@ -723,6 +864,7 @@ impl Server {
                     .iter()
                     .map(|s| (*s).into())
                     .collect(),
+                server_version: Some(env!("CARGO_PKG_VERSION").into()),
             }))?;
             self.dirty = true;
             return Ok(());
@@ -921,15 +1063,215 @@ impl Server {
             Request::Acknowledge { notification } => {
                 self.activity.acknowledge(notification)?;
             }
+            Request::AcknowledgeAll => {
+                self.activity.acknowledge_all()?;
+                self.workspace.ui.notifications = self.activity.all().to_vec();
+            }
+            Request::SessionEvents { enabled } => {
+                let stream = self.clients.get_mut(&id).unwrap().stream.as_mut().unwrap();
+                stream.session_events = enabled;
+                // The next update carries the per-pane session data.
+                stream.metadata = None;
+            }
+            Request::HostStatus { enabled } => {
+                let stream = self.clients.get_mut(&id).unwrap().stream.as_mut().unwrap();
+                stream.host = enabled;
+                stream.metadata = None;
+            }
+            Request::Spawn { request, cwd, argv } => {
+                let cwd = cwd.unwrap_or_else(|| self.config.cwd.clone());
+                let pane = self.spawn_requested(&request, cwd, argv)?;
+                self.reply(id, Event::Spawned { request, pane })?;
+            }
+            Request::Close { request, pane } => {
+                if !self.panes.contains_key(&pane) {
+                    return Err("unknown pane".into());
+                }
+                if self
+                    .leases
+                    .get(&pane)
+                    .is_some_and(|lease| lease.owner != id)
+                {
+                    return Err("pane is leased by another client".into());
+                }
+                // Closing the last pane keeps the composed UI's replacement shell.
+                self.remove_pane(pane, true)?;
+                self.reply(id, Event::Done { request })?;
+            }
+            Request::ClosedSessions { request } => {
+                if self.recovery_waiters.len() >= 64 {
+                    return Err("too many pending closed-session requests".into());
+                }
+                self.recovery_waiters.push((id, request));
+                self.start_recovery();
+            }
+            Request::Restore {
+                request,
+                record,
+                rerun,
+            } => {
+                let entry = self
+                    .records
+                    .iter()
+                    .find(|entry| entry.key == record)
+                    .cloned()
+                    .ok_or("unknown closed-session record; list closed sessions again")?;
+                let (pane, existing, _) = self.restore_record(&entry, rerun)?;
+                self.resize();
+                self.persist_geometry()?;
+                self.reply(
+                    id,
+                    Event::Restored {
+                        request,
+                        record,
+                        pane,
+                        existing,
+                    },
+                )?;
+            }
+            Request::History {
+                request,
+                pane,
+                start,
+                limit,
+            } => {
+                if limit > super::stream::MAX_HISTORY_LINES {
+                    return Err("history page exceeds 200 lines".into());
+                }
+                let lines = self
+                    .panes
+                    .get(&pane)
+                    .ok_or("unknown pane")?
+                    .terminal
+                    .history(start, limit);
+                self.reply(
+                    id,
+                    Event::History {
+                        request,
+                        pane,
+                        lines,
+                    },
+                )?;
+            }
+            Request::Search {
+                request,
+                panes,
+                query,
+                limit,
+            } => {
+                let unique: std::collections::BTreeSet<_> = panes.iter().copied().collect();
+                if query.is_empty()
+                    || query.len() > 256
+                    || query.chars().any(char::is_control)
+                    || limit == 0
+                    || limit > 64
+                    || unique.len() != panes.len()
+                    || panes.iter().any(|pane| !self.panes.contains_key(pane))
+                {
+                    return Err("invalid pane search".into());
+                }
+                let targets: Vec<PaneId> = if panes.is_empty() {
+                    self.panes.keys().copied().collect()
+                } else {
+                    panes
+                };
+                let mut results = Vec::new();
+                let mut remaining = limit;
+                let mut budget = super::stream::MAX_SEARCH_CONTEXT;
+                let mut truncated = false;
+                for pane in &targets {
+                    if remaining == 0 {
+                        // Unsearched panes may hold further matches.
+                        truncated = true;
+                        break;
+                    }
+                    let (hits, pane_truncated) =
+                        self.panes[pane].terminal.web_search(&query, remaining);
+                    let mut kept = Vec::new();
+                    let mut cut = false;
+                    for hit in hits {
+                        let bytes: usize = hit.lines.iter().map(String::len).sum();
+                        if bytes > budget {
+                            cut = true;
+                            break;
+                        }
+                        budget -= bytes;
+                        kept.push(hit);
+                    }
+                    remaining -= kept.len();
+                    truncated |= pane_truncated || cut;
+                    if !kept.is_empty() || pane_truncated || cut {
+                        results.push(super::stream::PaneSearchResult {
+                            pane: *pane,
+                            hits: kept,
+                            truncated: pane_truncated || cut,
+                        });
+                    }
+                    if cut {
+                        break;
+                    }
+                }
+                self.reply(
+                    id,
+                    Event::Search {
+                        request,
+                        results,
+                        truncated,
+                    },
+                )?;
+            }
+            Request::Scroll { pane, lines } => {
+                self.stream_owned(id, pane)?;
+                self.panes
+                    .get_mut(&pane)
+                    .unwrap()
+                    .terminal
+                    .scroll(lines.clamp(-10000, 10000));
+            }
+            Request::Reveal { pane, line } => {
+                self.stream_owned(id, pane)?;
+                self.panes
+                    .get_mut(&pane)
+                    .unwrap()
+                    .terminal
+                    .scroll_to(line)?;
+            }
+            Request::Shutdown { request } => {
+                self.reply(id, Event::Done { request })?;
+                self.stop(super::stream::StopReason::Shutdown);
+            }
             Request::Hello { .. } => unreachable!(),
         }
         self.dirty = true;
         Ok(())
     }
-    fn stream_frames(&mut self, vitals: super::vitals::Vitals) {
+    fn reply(&mut self, id: u64, event: super::stream::Event) -> Result<()> {
+        self.clients
+            .get_mut(&id)
+            .ok_or("unknown client")?
+            .send(ServerMessage::Stream(event))
+    }
+    fn stream_frames(
+        &mut self,
+        vitals: super::vitals::Vitals,
+        host: Option<Box<super::status::Snapshot>>,
+    ) {
         use super::stream::{Event, Lease, PaneSnapshot, Update};
         self.leases
             .retain(|pane, _| self.panes.get(pane).is_some_and(|pty| !pty.dead));
+        let sessions: Vec<_> = if self.clients.values().any(|client| {
+            client
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.session_events)
+        }) {
+            self.panes
+                .keys()
+                .filter_map(|id| self.pane_session(*id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut removed = Vec::new();
         for (id, client) in &mut self.clients {
             let idle =
@@ -965,6 +1307,12 @@ impl Server {
                     .collect(),
                 notifications: self.activity.snapshots(),
                 vitals: vitals.clone(),
+                sessions: if stream.session_events {
+                    sessions.clone()
+                } else {
+                    Vec::new()
+                },
+                host: if stream.host { host.clone() } else { None },
             };
             stream.panes.retain(|pane| self.panes.contains_key(pane));
             stream
@@ -1018,6 +1366,8 @@ impl Server {
                 leases: update.leases.clone(),
                 notifications: update.notifications.clone(),
                 vitals: update.vitals.clone(),
+                sessions: update.sessions.clone(),
+                host: update.host.clone(),
             };
             if update.snapshots.is_empty()
                 && update.patches.is_empty()
@@ -1167,6 +1517,24 @@ impl Server {
                         }
                     }
                     closed.retain(|e| !self.history.restored.contains(&e.key));
+                    let mut records = closed.clone();
+                    records.sort_by_key(|e| std::cmp::Reverse(e.closed_at));
+                    records.truncate(256);
+                    for (client, request) in std::mem::take(&mut self.recovery_waiters) {
+                        if let Some(client) = self.clients.get_mut(&client) {
+                            let _ = client.send(ServerMessage::Stream(
+                                super::stream::Event::ClosedSessions {
+                                    request,
+                                    records: records.iter().cloned().map(Into::into).collect(),
+                                },
+                            ));
+                        }
+                    }
+                    self.records = records;
+                    if !self.recovery_for_ui {
+                        self.recovery_job = None;
+                        return;
+                    }
                     if self.reopen_pending.is_some() {
                         let current = self
                             .config
@@ -1189,10 +1557,24 @@ impl Server {
                     self.workspace.ui.recovery = entries;
                 }
                 Err(error) => {
+                    for (client, request) in std::mem::take(&mut self.recovery_waiters) {
+                        if let Some(client) = self.clients.get_mut(&client) {
+                            let _ =
+                                client.send(ServerMessage::Stream(super::stream::Event::Error {
+                                    message: format!("closed sessions: {error}"),
+                                    request: Some(request),
+                                }));
+                        }
+                    }
+                    if !self.recovery_for_ui {
+                        self.recovery_job = None;
+                        return;
+                    }
                     self.reopen_pending = None;
                     self.notice = Some(format!("Recovery: {error}"));
                 }
             }
+            self.recovery_for_ui = false;
             self.workspace.ui.recovery_loading = false;
             self.recovery_job = None;
             self.dirty = true;
@@ -1348,7 +1730,14 @@ impl Server {
                     .is_some_and(|id| self.panes.get(&id).is_none_or(|pane| pane.dead));
                 if dead {
                     if let Some(id) = self.workspace.ui.scratch.take() {
-                        self.panes.remove(&id);
+                        if self.panes.remove(&id).is_some() {
+                            self.session_event(super::stream::Event::PaneClosed {
+                                pane: id,
+                                at: crate::now(),
+                                reason: super::stream::CloseReason::Exited,
+                                record: None,
+                            });
+                        }
                         self.workspace.panes.retain(|pane| pane.id != id);
                     }
                     self.workspace.ui.scratch_visible = false;
@@ -1380,22 +1769,11 @@ impl Server {
                 self.workspace.apply(action)?;
             }
             Action::Recovery => {
-                if self.recovery_job.is_none() {
+                // A job started by a stream request may already be running.
+                if self.recovery_job.is_none() || !self.recovery_for_ui {
                     self.workspace.ui.closed_tabs.clear();
-                    let state = self.config.state_dir.clone();
-                    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let worker_cancel = cancel.clone();
-                    let worker = std::thread::spawn(move || {
-                        let result = super::recovery::collect_cancellable(&state, &worker_cancel)
-                            .map(|agents| (agents, super::history::collect(&state)));
-                        let _ = sender.send(result);
-                    });
-                    self.recovery_job = Some(RecoveryJob {
-                        receiver,
-                        cancel,
-                        worker: Some(worker),
-                    });
+                    self.recovery_for_ui = true;
+                    self.start_recovery();
                     self.workspace.ui.recovery_loading = true;
                 }
                 self.workspace.apply(action)?;
@@ -1561,13 +1939,33 @@ impl Server {
             self.workspace.apply(&Action::ScratchClose)?;
         }
         self.workspace.track_focus();
+        let mut record = None;
         if !is_scratch {
             self.history.close(&self.epoch, id, crate::now());
             self.history
                 .save(&self.config.state_dir.join("tab-history.json"))?;
+            let key = format!("{}:{id}", self.epoch);
+            record = self
+                .history
+                .entries
+                .iter()
+                .any(|entry| entry.key == key)
+                .then_some(key);
         }
+        let reason = if self.panes[&id].dead {
+            super::stream::CloseReason::Exited
+        } else {
+            super::stream::CloseReason::Closed
+        };
         self.panes.remove(&id);
         self.workspace.panes.retain(|pane| pane.id != id);
+        self.leases.remove(&id);
+        self.session_event(super::stream::Event::PaneClosed {
+            pane: id,
+            at: crate::now(),
+            reason,
+            record,
+        });
         self.aliases.remove(&id);
         self.workspace.ui.config.pane_colors.remove(&id);
         self.workspace.ui.unused.retain(|pane| *pane != id);
@@ -1614,7 +2012,7 @@ impl Server {
             self.workspace.reading = ReadingMode::Grid;
         }
         if !replace_last && !is_scratch && main_count == 1 && self.workspace.ui.scratch.is_none() {
-            self.shutdown = true;
+            self.stop(super::stream::StopReason::LastPaneExited);
             for client in self.clients.values_mut().filter(|client| client.attached) {
                 let _ = client.send(ServerMessage::Detached);
             }
@@ -1645,9 +2043,16 @@ impl Server {
         self.spawn_pane(specification)
     }
     fn spawn_pane(&mut self, specification: Option<super::templates::TemplatePane>) -> Result<()> {
-        self.spawn_pane_command(specification, None)
+        self.spawn_pane_command(specification, None, Vec::new())
     }
-    fn reopen_tab(&mut self, entry: super::history::Entry, rerun: bool) -> Result<()> {
+    /// The session half of restoring a closed-session record, shared by the
+    /// composed UI and the stream `restore` request. Returns the pane, whether
+    /// it already existed, and whether its original folder had disappeared.
+    fn restore_record(
+        &mut self,
+        entry: &super::history::Entry,
+        rerun: bool,
+    ) -> Result<(PaneId, bool, bool)> {
         let cwd = PathBuf::from(&entry.cwd);
         let command = entry
             .command()
@@ -1683,13 +2088,56 @@ impl Server {
                 }
             }
         }
-        if let Some(existing) = self.workspace.panes.iter().find(|pane| {
-            entry.session_id.is_some()
-                && pane.kind == entry.kind
-                && pane.session_id == entry.session_id
-        }) {
-            let id = existing.id;
-            if existing.parked {
+        let existing = self
+            .workspace
+            .panes
+            .iter()
+            .find(|pane| {
+                entry.session_id.is_some()
+                    && pane.kind == entry.kind
+                    && pane.session_id == entry.session_id
+            })
+            .map(|pane| pane.id);
+        let id = if let Some(id) = existing {
+            id
+        } else {
+            self.spawn_pane_command(
+                Some(super::templates::TemplatePane {
+                    name: "shell".into(),
+                    cwd,
+                    shell: None,
+                }),
+                command.as_deref(),
+                Vec::new(),
+            )?;
+            let id = self.workspace.panes.last().unwrap().id;
+            self.aliases.remove(&id);
+            if let Some(pane) = self.workspace.panes.last_mut() {
+                pane.kind = entry.kind;
+                pane.session_id = entry.session_id.clone();
+                if entry.kind.is_some() {
+                    pane.title = entry.name.clone();
+                }
+            }
+            id
+        };
+        self.history.consume(&entry.key);
+        self.history
+            .save(&self.config.state_dir.join("tab-history.json"))?;
+        self.workspace.ui.closed_tabs.retain(|e| e.key != entry.key);
+        self.records.retain(|e| e.key != entry.key);
+        self.dirty = true;
+        Ok((id, existing.is_some(), moved))
+    }
+    fn reopen_tab(&mut self, entry: super::history::Entry, rerun: bool) -> Result<()> {
+        let (id, existing, moved) = self.restore_record(&entry, rerun)?;
+        if existing {
+            if self
+                .workspace
+                .panes
+                .iter()
+                .any(|pane| pane.id == id && pane.parked)
+            {
                 self.workspace.apply(&Action::Restore(id))?;
             }
             if self.workspace.ui.scratch_visible {
@@ -1699,28 +2147,7 @@ impl Server {
             self.workspace.reading = ReadingMode::Tabs(id);
             self.workspace.ui.tab_scroll_anchor = None;
             self.workspace.ui.dialog = None;
-            self.history.consume(&entry.key);
-            self.history
-                .save(&self.config.state_dir.join("tab-history.json"))?;
-            self.workspace.ui.closed_tabs.retain(|e| e.key != entry.key);
             return Ok(());
-        }
-        self.spawn_pane_command(
-            Some(super::templates::TemplatePane {
-                name: "shell".into(),
-                cwd,
-                shell: None,
-            }),
-            command.as_deref(),
-        )?;
-        let id = self.workspace.panes.last().unwrap().id;
-        self.aliases.remove(&id);
-        if let Some(pane) = self.workspace.panes.last_mut() {
-            pane.kind = entry.kind;
-            pane.session_id = entry.session_id.clone();
-            if entry.kind.is_some() {
-                pane.title = entry.name.clone();
-            }
         }
         if self.workspace.ui.scratch_visible {
             self.workspace.apply(&Action::ScratchClose)?;
@@ -1731,10 +2158,6 @@ impl Server {
         self.workspace.ui.config.view_modes[super::ui::geometry_bucket(self.workspace.cols)] =
             Some(true);
         self.workspace.ui.dialog = None;
-        self.history.consume(&entry.key);
-        self.history
-            .save(&self.config.state_dir.join("tab-history.json"))?;
-        self.workspace.ui.closed_tabs.retain(|e| e.key != entry.key);
         self.persist_geometry()?;
         if moved {
             let folder = self.workspace.panes.last().map_or("", |pane| &pane.cwd);
@@ -1752,6 +2175,7 @@ impl Server {
         &mut self,
         specification: Option<super::templates::TemplatePane>,
         startup: Option<&str>,
+        argv: Vec<String>,
     ) -> Result<()> {
         let id = self.next_pane;
         let original_cwd = self.config.cwd.clone();
@@ -1788,6 +2212,7 @@ impl Server {
         self.config.cwd = original_cwd;
         self.config.shell = original_shell;
         let mut pane = pane?;
+        pane.argv = argv;
         pane.terminal.set_theme(self.terminal_theme());
         let title = specification
             .as_ref()
@@ -1825,6 +2250,9 @@ impl Server {
         if self.workspace.active == 0 {
             self.workspace.active = id;
         }
+        if let Some(session) = self.pane_session(id) {
+            self.session_event(super::stream::Event::PaneCreated { session });
+        }
         Ok(())
     }
     fn resize(&mut self) {
@@ -1845,14 +2273,22 @@ impl Server {
     }
     fn message(&mut self, id: u64, message: ClientMessage) -> Result<()> {
         if let ClientMessage::Stream(request) = message {
-            let result = self.stream_request(id, request);
+            let correlation = request.correlation().map(str::to_owned);
+            let result = if correlation
+                .as_deref()
+                .is_some_and(|request| !super::stream::valid_request(request))
+            {
+                Err("invalid request identifier".into())
+            } else {
+                self.stream_request(id, request)
+            };
             if let Err(error) = result {
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::Stream(super::stream::Event::Error {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.send(ServerMessage::Stream(super::stream::Event::Error {
                         message: error.to_string(),
+                        request: correlation.filter(|r| super::stream::valid_request(r)),
                     }))?;
+                }
             }
             return Ok(());
         }
@@ -1864,61 +2300,7 @@ impl Server {
                 if self.clients[&id].attached && self.controller != Some(id) {
                     return Err("observers cannot create panes".into());
                 }
-                if request.is_empty()
-                    || request.len() > 128
-                    || !request
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-                    || !cwd.is_absolute()
-                    || argv.len() > 32
-                    || argv.iter().map(String::len).sum::<usize>() > 8192
-                    || argv.iter().any(|arg| arg.contains('\0'))
-                    || argv.first().is_some_and(|arg| arg.is_empty())
-                {
-                    return Err("invalid pane creation request".into());
-                }
-                let cwd = cwd.canonicalize()?;
-                if !cwd.is_dir() {
-                    return Err("working directory must be a directory".into());
-                }
-                let pane = if let Some((pane, previous_cwd, previous_argv)) =
-                    self.spawn_requests.get(&request)
-                {
-                    if previous_cwd != &cwd || previous_argv != &argv {
-                        return Err(
-                            "creation request was already used with different parameters".into(),
-                        );
-                    }
-                    if !self.panes.contains_key(pane) {
-                        return Err("created pane has already closed".into());
-                    }
-                    *pane
-                } else {
-                    let pane = self.next_pane;
-                    let startup = (!argv.is_empty()).then(|| {
-                        argv.iter()
-                            .map(|arg| crate::shell_quote(arg))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    });
-                    self.spawn_pane_command(
-                        Some(super::templates::TemplatePane {
-                            name: "shell".into(),
-                            cwd: cwd.clone(),
-                            shell: None,
-                        }),
-                        startup.as_deref(),
-                    )?;
-                    self.aliases.remove(&pane);
-                    if self.spawn_requests.len() >= 512 {
-                        self.spawn_requests.pop_first();
-                    }
-                    self.spawn_requests
-                        .insert(request.clone(), (pane, cwd, argv));
-                    self.resize();
-                    self.dirty = true;
-                    pane
-                };
+                let pane = self.spawn_requested(&request, cwd, argv)?;
                 self.clients
                     .get_mut(&id)
                     .unwrap()
@@ -2052,7 +2434,7 @@ impl Server {
                             self.leases.remove(&pane);
                             self.resize();
                         }
-                        Action::Shutdown => self.shutdown = true,
+                        Action::Shutdown => self.stop(super::stream::StopReason::Shutdown),
                         Action::Grid { .. } => return Err("grid layout is automatic".into()),
                         Action::ClosePaneConfirm(pane) => self.close_pane(pane)?,
                         Action::Focus(_)
@@ -2273,7 +2655,7 @@ impl Server {
                         );
                         if !self.feature_action(id, &action)? {
                             match action {
-                                Action::Shutdown => self.shutdown = true,
+                                Action::Shutdown => self.stop(super::stream::StopReason::Shutdown),
                                 Action::Grid { .. } => {
                                     return Err("grid layout is automatic".into());
                                 }
@@ -2554,7 +2936,14 @@ impl Server {
                     }
                 }
             }
-            if !pane.dead && pane.child.try_wait().ok().flatten().is_some() {
+            let status = if pane.dead {
+                None
+            } else {
+                pane.child.try_wait().ok().flatten()
+            };
+            if let Some(status) = status {
+                use std::os::unix::process::ExitStatusExt;
+                pane.exit = Some((status.code(), status.signal()));
                 exited.push(*id);
                 pane.dead = true;
                 pane.pending.clear();
@@ -2572,6 +2961,13 @@ impl Server {
             }
         }
         for id in exited {
+            let (code, signal) = self.panes[&id].exit.unwrap_or_default();
+            self.session_event(super::stream::Event::PaneExited {
+                pane: id,
+                at: crate::now(),
+                code,
+                signal,
+            });
             if let Err(error) = self.remove_pane(id, false) {
                 self.notice = Some(format!("Close exited tab: {error}"));
             }
@@ -2900,13 +3296,18 @@ impl Server {
             .dialog
             .is_some_and(|dialog| dialog.kind == super::ui::DialogKind::Status)
             && self.clients.values().any(|client| client.attached);
-        self.workspace.ui.status = if status_open {
-            self.status.poll(true).clone()
+        let host_wanted = self
+            .clients
+            .values()
+            .any(|client| client.stream.as_ref().is_some_and(|stream| stream.host));
+        let host = if status_open || host_wanted {
+            Some(self.status.poll(true).clone())
         } else {
             self.status.poll(false);
-            super::status::Snapshot::default()
+            None
         };
-        self.stream_frames(vitals.clone());
+        self.workspace.ui.status = host.clone().filter(|_| status_open).unwrap_or_default();
+        self.stream_frames(vitals.clone(), host.filter(|_| host_wanted).map(Box::new));
         if !attached {
             self.dirty = false;
             return;
@@ -2965,6 +3366,7 @@ impl Server {
     }
     fn remove_client(&mut self, id: u64) {
         self.clients.remove(&id);
+        self.recovery_waiters.retain(|(client, _)| *client != id);
         let before = self.leases.len();
         self.leases.retain(|_, lease| lease.owner != id);
         if before != self.leases.len() {
@@ -3131,6 +3533,9 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
         controller: None,
         next_pane: 1,
         spawn_requests: BTreeMap::new(),
+        records: Vec::new(),
+        recovery_waiters: Vec::new(),
+        recovery_for_ui: false,
         next_client: 1,
         dirty: true,
         notice: None,
@@ -3373,6 +3778,20 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
                 if attached || streaming { 10 } else { 100 },
             );
         }
+    }
+    // Give queued replies, `server_stopping` and `Detached` a bounded chance
+    // to reach their clients before the sockets close.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        server.clients.retain(|_, client| client.flush().is_ok());
+        if server
+            .clients
+            .values()
+            .all(|client| client.writing.is_none() && client.output.is_empty())
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
     drop(requests);
     drop(results);

@@ -32,6 +32,7 @@ impl State {
                 client,
                 epoch,
                 capabilities,
+                ..
             } => {
                 if !self.epoch.is_empty()
                     || version != stream::VERSION
@@ -125,7 +126,19 @@ impl State {
                 }
             }
             Event::Clipboard { .. } => return Err("unsolicited clipboard event".into()),
-            Event::Error { message } => return Err(message.into()),
+            Event::Error { message, .. } => return Err(message.into()),
+            // This read-only client never opts in to lifecycle events or sends
+            // correlated requests, so any such event is a server bug.
+            Event::PaneCreated { .. }
+            | Event::PaneExited { .. }
+            | Event::PaneClosed { .. }
+            | Event::ServerStopping { .. }
+            | Event::Spawned { .. }
+            | Event::Done { .. }
+            | Event::ClosedSessions { .. }
+            | Event::Restored { .. }
+            | Event::History { .. }
+            | Event::Search { .. } => return Err("unsolicited session API event".into()),
         }
         Ok(())
     }

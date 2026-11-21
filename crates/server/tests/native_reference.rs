@@ -9,6 +9,7 @@ fn hello() -> Event {
         client: 5,
         epoch: "unique-server-epoch".into(),
         capabilities: vec!["pane-patches".into()],
+        server_version: None,
     }
 }
 fn snapshot(pane: u64) -> PaneSnapshot {
@@ -43,6 +44,8 @@ fn update() -> Update {
         leases: vec![],
         notifications: vec![],
         vitals: Default::default(),
+        sessions: vec![],
+        host: None,
     }
 }
 fn state() -> State {
@@ -91,7 +94,8 @@ fn epoch_handshake_and_missing_baseline_errors_are_transactional() {
                 version: 999,
                 client: 5,
                 epoch: "x".into(),
-                capabilities: vec![]
+                capabilities: vec![],
+                server_version: None,
             })
             .is_err()
     );

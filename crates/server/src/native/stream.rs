@@ -19,12 +19,21 @@
 //! Server retains one in-flight packet and one replaceable aggregate update; excess
 //! reliable responses disconnect a slow peer. Notifications are the latest 128
 //! retained records, not an exactly-once event log; acknowledgement is explicit.
-//! History paging, tab lifecycle commands and device/MCP capabilities are deferred.
+//!
+//! The session API (capabilities `pane-lifecycle`, `closed-sessions`,
+//! `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status` and
+//! `server-lifecycle`) is additive. Its events are sent only to a connection
+//! that asked for them, either by opting in (`session_events`, `host_status`)
+//! or by sending a correlated request, so v1 clients that reject unknown
+//! events never receive one. Clients must check the Welcome capabilities
+//! before sending a new request: an older server disconnects on an unknown
+//! request type. Device/MCP capabilities remain deferred.
 use super::protocol::{
-    Cell, Cursor, InputModes, MouseEvent, Notification, PaneId, PaneInfo, Screen,
+    Cell, Cursor, InputModes, MouseEvent, Notification, PaneId, PaneInfo, PaneSearchMatch, Screen,
 };
 use crate::Result;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const VERSION: u16 = 1;
 pub const MAX_SUBSCRIPTIONS: usize = 10;
@@ -49,7 +58,27 @@ pub const CAPABILITIES: &[&str] = &[
     "controller-theme",
     "clipboard-write",
     "pane-spawn",
+    "pane-lifecycle",
+    "closed-sessions",
+    "pane-history",
+    "pane-scroll",
+    "notification-ack-all",
+    "host-status",
+    "server-lifecycle",
 ];
+/// Aggregate context budget of one multi-pane `search` reply.
+pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
+/// Longest `history` page.
+pub const MAX_HISTORY_LINES: usize = 200;
+
+/// Client-chosen correlation identifiers: 1–128 ASCII letters, digits, `-` or `_`.
+pub fn valid_request(request: &str) -> bool {
+    !request.is_empty()
+        && request.len() <= 128
+        && request
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -99,6 +128,150 @@ pub enum Request {
     Acknowledge {
         notification: u64,
     },
+    /// `notification-ack-all`: mark every retained notification read.
+    AcknowledgeAll,
+    /// `pane-lifecycle`: receive lifecycle events and per-pane session data.
+    SessionEvents {
+        enabled: bool,
+    },
+    /// `pane-lifecycle`: start a pane. Without `cwd`, the server's launch
+    /// directory is used; an empty `argv` opens an interactive shell. A retry
+    /// with the same `request`, directory and arguments returns the same pane.
+    Spawn {
+        request: String,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
+    /// `pane-lifecycle`: terminate a pane's process group and remove the pane.
+    /// Refused while another connection holds the pane's lease.
+    Close {
+        request: String,
+        pane: PaneId,
+    },
+    /// `closed-sessions`: list restorable records of closed panes.
+    ClosedSessions {
+        request: String,
+    },
+    /// `closed-sessions`: reopen a listed record. `rerun` repeats a plain
+    /// program; agent records always resume their conversation if known.
+    Restore {
+        request: String,
+        record: String,
+        #[serde(default)]
+        rerun: bool,
+    },
+    /// `pane-history`: plain-text rows; negative lines are scrollback.
+    History {
+        request: String,
+        pane: PaneId,
+        start: i32,
+        limit: usize,
+    },
+    /// `pane-history`: literal case-insensitive search. An empty pane list
+    /// searches every pane in creation order.
+    Search {
+        request: String,
+        #[serde(default)]
+        panes: Vec<PaneId>,
+        query: String,
+        limit: usize,
+    },
+    /// `pane-scroll`: move the leased pane's viewport through its scrollback.
+    Scroll {
+        pane: PaneId,
+        lines: i32,
+    },
+    /// `pane-scroll`: show a primary-history line (as returned by `history`
+    /// or a search match's `first_line + start.y`) in the leased pane.
+    Reveal {
+        pane: PaneId,
+        line: i32,
+    },
+    /// `host-status`: include the host process/disk snapshot in updates.
+    HostStatus {
+        enabled: bool,
+    },
+    /// `server-lifecycle`: stop the server and every pane process.
+    Shutdown {
+        request: String,
+    },
+}
+impl Request {
+    /// The correlation identifier echoed by this request's reply and errors.
+    pub fn correlation(&self) -> Option<&str> {
+        match self {
+            Self::Spawn { request, .. }
+            | Self::Close { request, .. }
+            | Self::ClosedSessions { request }
+            | Self::Restore { request, .. }
+            | Self::History { request, .. }
+            | Self::Search { request, .. }
+            | Self::Shutdown { request } => Some(request),
+            _ => None,
+        }
+    }
+}
+
+/// Session facts about a live pane, independent of any client's presentation.
+/// Pane IDs increase monotonically and are never reused within one epoch, so
+/// they also give creation order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSession {
+    pub pane: PaneId,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// The directory the shell was started in; `PaneInfo::cwd` is the current one.
+    pub launch_cwd: String,
+    pub shell: String,
+    /// Arguments given to `spawn`; empty for an interactive shell or another origin.
+    pub argv: Vec<String>,
+    /// The command line typed into the shell at startup, if any.
+    pub startup: Option<String>,
+    /// The latest OSC title set by the application, unmodified by naming rules.
+    pub terminal_title: Option<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// The pane's process exited.
+    Exited,
+    /// A client closed the pane.
+    Closed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// An explicit shutdown request.
+    Shutdown,
+    /// The last pane exited and no other pane keeps the server alive.
+    LastPaneExited,
+}
+/// A restorable record of a closed pane. `key` identifies it for `restore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosedSession {
+    #[serde(flatten)]
+    pub record: super::history::Entry,
+    /// The agent resume command `restore` runs, if the record is an agent.
+    pub resume: Option<String>,
+    /// The program `restore` with `rerun` runs, if the record is a program.
+    pub rerun: Option<String>,
+}
+impl From<super::history::Entry> for ClosedSession {
+    fn from(record: super::history::Entry) -> Self {
+        Self {
+            resume: record.command(),
+            rerun: record.previous_command(),
+            record,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneSearchResult {
+    pub pane: PaneId,
+    pub hits: Vec<PaneSearchMatch>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +326,12 @@ pub struct Update {
     pub leases: Vec<Lease>,
     pub notifications: Vec<Notification>,
     pub vitals: super::vitals::Vitals,
+    /// Only for connections that enabled `session_events`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<PaneSession>,
+    /// Only for connections that enabled `host_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<Box<super::status::Snapshot>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -162,6 +341,9 @@ pub enum Event {
         client: u64,
         epoch: String,
         capabilities: Vec<String>,
+        /// The server's package version (`server-lifecycle`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_version: Option<String>,
     },
     Update(Update),
     Lease {
@@ -174,6 +356,59 @@ pub enum Event {
     },
     Error {
         message: String,
+        /// The failed request's correlation identifier, when it had one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<String>,
+    },
+    /// Opt-in lifecycle events. A pending update built before the event is
+    /// discarded, so the next update for that connection follows the event.
+    PaneCreated {
+        session: PaneSession,
+    },
+    PaneExited {
+        pane: PaneId,
+        at: u64,
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    PaneClosed {
+        pane: PaneId,
+        at: u64,
+        reason: CloseReason,
+        /// The closed-session record created for this pane, if any.
+        record: Option<String>,
+    },
+    ServerStopping {
+        reason: StopReason,
+    },
+    /// Replies to correlated requests; sent only to the requesting connection.
+    Spawned {
+        request: String,
+        pane: PaneId,
+    },
+    Done {
+        request: String,
+    },
+    ClosedSessions {
+        request: String,
+        records: Vec<ClosedSession>,
+    },
+    Restored {
+        request: String,
+        record: String,
+        pane: PaneId,
+        /// The conversation was already open in this pane; nothing was started.
+        existing: bool,
+    },
+    History {
+        request: String,
+        pane: PaneId,
+        lines: Vec<(i32, String)>,
+    },
+    Search {
+        request: String,
+        results: Vec<PaneSearchResult>,
+        truncated: bool,
     },
 }
 

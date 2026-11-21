@@ -28,13 +28,13 @@ Every record has a four-byte unsigned big-endian payload length followed by UTF-
 {"Stream":{"type":"hello","version":1}}
 ```
 
-The server responds with `Stream` / `welcome`, containing stream version, connection/client ID, a random server epoch, and supported capabilities. Send Hello exactly once before other stream requests. Legacy TUI/management messages are rejected on a negotiated stream connection and by the bridge. Unsupported versions fail clearly. Current capabilities are `pane-snapshots`, `pane-patches`, `pane-leases`, `metadata`, `notifications`, `vitals`, `hyperlinks`, `program-status`, `controller-theme` and `clipboard-write`; do not infer support for undeclared future capabilities.
+The server responds with `Stream` / `welcome`, containing stream version, connection/client ID, a random server epoch, and supported capabilities. Send Hello exactly once before other stream requests. Legacy TUI/management messages are rejected on a negotiated stream connection and by the bridge. Unsupported versions fail clearly. Current capabilities are `pane-snapshots`, `pane-patches`, `pane-leases`, `metadata`, `notifications`, `vitals`, `hyperlinks`, `program-status`, `controller-theme`, `clipboard-write` and `pane-spawn`, plus the [session API](#session-api) capabilities `pane-lifecycle`, `closed-sessions`, `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status` and `server-lifecycle`; do not infer support for undeclared future capabilities. A server with `server-lifecycle` also puts its package version in Welcome `server_version`.
 
 Clients recognizing `clipboard-write` may opt in with `{"Stream":{"type":"clipboard","enabled":true}}`. Application OSC 52 writes then produce `clipboard` events containing `pane` and UTF-8 `text` (at most 64 KiB), delivered only to that pane's current lease owner. Observers and clients that have not opted in receive no clipboard data. Writes from panes without a stream owner retain their existing TUI-controller route. Clipboard events are ephemeral: never replay them in snapshots, history or reconnect state. Clipboard reads remain disabled. Browser clients must provide an explicit copy fallback when platform user-activation rules prevent an asynchronous write.
 
 The `pane-spawn` capability advertises structured local administration on a separate, same-UID socket connection: `SpawnPane { request, cwd, argv }` returns `SpawnedPane { request, pane }`. The initial absolute working directory is set before the interactive shell starts; argument strings are quoted as data, not accepted as a shell command. An empty argument list opens a shell. This does not transfer input ownership or change the current active pane. Retry identities are checked against the directory and arguments in a bounded 512-entry cache for the current server epoch; durable application-level request records belong to the management caller. Attached observers cannot invoke this operation. This primitive introduces no project model or HTTP management endpoint into the terminal server.
 
-Pane IDs are scoped to the Welcome epoch. A new epoch invalidates previous screen baselines and ownership. Clients must negotiate anew, obtain snapshots, and deliberately rebuild desired control state rather than replaying old mutations. Experimental v1 does not yet carry correlation IDs or an expected epoch on every mutation; these remain part of public-contract maturation in the ADR.
+Pane IDs are scoped to the Welcome epoch. Within an epoch they increase monotonically and are never reused, so they also give creation order. A new epoch invalidates previous screen baselines and ownership. Clients must negotiate anew, obtain snapshots, and deliberately rebuild desired control state rather than replaying old mutations. Client UI state keyed by pane identity (epoch plus pane ID) does not survive a new epoch. The v1 operations carry no correlation ID or expected epoch; the session API requests carry a correlation ID (below). An expected epoch on every mutation remains part of public-contract maturation in the ADR.
 
 ## Pane subscriptions and updates
 
@@ -79,8 +79,96 @@ kelpserver stream-inspect --workspace NAME 1 2
 
 With no pane IDs it returns metadata only; explicit IDs add those panes' terminal cells to JSON stdout. It does not claim, resize, become the TUI controller, start a server or persist terminal contents. Automated tests use actual bridge subprocess pipes, disposable PTYs and typed reference state; they do not open a real SSH login or access a native device.
 
-The older `InspectPane` and bounded `History {pane,start,limit}` requests remain local inspection seams. `SearchPane {pane,query,limit}` returns `PaneSearch {pane,hits,truncated}` with case-insensitive literal occurrences; queries must contain 1–256 bytes without control characters and the limit is at most 64 matches. Each match carries its source buffer, immutable context rows, and inclusive cell coordinates relative to that context. This prevents ongoing output or alternate-screen transitions from moving the target between search and reveal. Context text has a combined 4 MiB budget; `truncated` indicates that a match or context budget stopped the search. Search does not change another client's viewport or input ownership. Ordinary history pages still use relative line indices and plain text; stable, styled native-history pagination is not implemented. Native pane create/rename/terminate commands, device capability requests, attachments, MCP, native apps and final public-protocol compatibility guarantees remain future work described in ADR 0001.
+The older `InspectPane` and bounded `History {pane,start,limit}` requests remain local inspection seams. `SearchPane {pane,query,limit}` returns `PaneSearch {pane,hits,truncated}` with case-insensitive literal occurrences; queries must contain 1–256 bytes without control characters and the limit is at most 64 matches. Each match carries its source buffer, immutable context rows, and inclusive cell coordinates relative to that context. This prevents ongoing output or alternate-screen transitions from moving the target between search and reveal. Context text has a combined 4 MiB budget; `truncated` indicates that a match or context budget stopped the search. Search does not change another client's viewport or input ownership. Ordinary history pages still use relative line indices and plain text; stable, styled native-history pagination is not implemented. The same history and search are available on the stream itself through `pane-history` (below). Pane renaming is client UI. Device capability requests, attachments, MCP, native apps and final public-protocol compatibility guarantees remain future work described in ADR 0001.
 
 ### Hyperlink cells
 
 The server's `hyperlinks` capability indicates support for an optional `hyperlink` URI string per cell. Missing fields mean no target; explicit targets and recognized plain HTTP(S) URLs are carried independently of visible text. Targets are bounded to 2,048 bytes, require a URI scheme and reject whitespace and control characters. Deltas include target-only changes. Native clients open links through their own user interaction rather than requesting browser execution on the server. Older cell encodings remain decodable.
+
+## Session API
+
+The session API is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the session-level operations a full TUI needs to run as a stream client with local rendering and local UI state. The classification of every TUI capability, and what remains, is in [session-api.md](session-api.md). The composed protocol 58 is unchanged.
+
+### Compatibility
+
+The stream stays at version 1; nothing in v1 changed meaning. Every addition is either a new optional field or a new request or event type behind one of these Welcome capabilities:
+
+| Capability | Requests | Events and fields |
+| --- | --- | --- |
+| `pane-lifecycle` | `session_events {enabled}`, `spawn`, `close` | `pane_created`, `pane_exited`, `pane_closed`, `spawned`, `done`, `Update.sessions` |
+| `closed-sessions` | `closed_sessions`, `restore` | `closed_sessions`, `restored` |
+| `pane-history` | `history`, `search` | `history`, `search` |
+| `pane-scroll` | `scroll`, `reveal` | none |
+| `notification-ack-all` | `acknowledge_all` | none |
+| `host-status` | `host_status {enabled}` | `Update.host` |
+| `server-lifecycle` | `shutdown` | `server_stopping`, Welcome `server_version` |
+
+Rules that keep older peers working:
+
+- A connection receives an event of a new type only after it opts in (`session_events`, `host_status`) or as the reply to a request it sent. Existing clients that reject unknown event types (KelpClient, KelpHub's bridge) therefore never see one. `Update.sessions` and `Update.host` are omitted unless enabled.
+- New fields on existing messages (`Welcome.server_version`, `Error.request`, `Update.sessions`, `Update.host`) are optional; decoders that ignore unknown fields are unaffected.
+- A server without a capability disconnects a connection that sends an unknown request type. Check the Welcome capabilities before sending any request listed above.
+- The SSH bridge relays every stream request after Hello, so the session API works through `kelpserver bridge` unchanged.
+
+In the Rust API, `Event::Welcome`, `Event::Error` and `Update` gained fields and `Request`/`Event` gained variants, so exhaustive matches and struct literals in consumers need updating when they move their pin.
+
+### Correlation and errors
+
+Requests that have a reply carry a client-chosen `request` string of 1–128 ASCII letters, digits, `-` or `_`. The reply echoes it, and so does `{"type":"error","message":…,"request":…}` when such a request fails. A malformed identifier fails with an error without `request`. Errors of v1 requests still have no `request`. Fire-and-forget requests (`scroll`, `reveal`, `acknowledge_all`, the opt-ins) have no identifier and no reply, like `resize` or `acknowledge`.
+
+### Pane lifecycle (`pane-lifecycle`)
+
+```json
+{"Stream":{"type":"session_events","enabled":true}}
+```
+
+After the opt-in, each update carries `sessions`, one `PaneSession` per live pane in ID order: `pane`, `created_at` (Unix seconds), `launch_cwd`, `shell`, `argv` (the `spawn` arguments, otherwise empty), `startup` (the command line typed into the shell at startup, if any) and `terminal_title` (the application's latest OSC title, unmodified). `Update.panes` keeps carrying the observations: current cwd, process, agent kind and session, status and evidence, activity times and shell command.
+
+Lifecycle events follow, for every pane whatever created or closed it, including the composed TUI:
+
+- `{"type":"pane_created","session":{…}}`;
+- `{"type":"pane_exited","pane":3,"at":…,"code":0,"signal":null}`, when the process exits, always followed by `pane_closed`;
+- `{"type":"pane_closed","pane":3,"at":…,"reason":"exited"|"closed","record":"<key>"|null}`, where `record` names the closed-session record created for the pane, if any.
+
+Events are reliable messages. A replaceable update that was built before an event and is still pending is discarded with that connection's screen baselines, so the next update (a full one) already reflects the event. Updates that were already on the wire may precede it.
+
+```json
+{"Stream":{"type":"spawn","request":"r1","cwd":"/home/me/src","argv":["htop"]}}
+{"Stream":{"type":"close","request":"r2","pane":3}}
+```
+
+`spawn` takes the same parameters as the `pane-spawn` administration request; `cwd` defaults to the server's launch directory and an empty `argv` opens an interactive shell. Arguments are quoted as data and run before `exec $SHELL -i`. The server removes agent and multiplexer session markers from the environment; clients cannot pass variables. A retry with the same `request`, directory and arguments returns the same pane (bounded 512-entry cache per epoch). The reply is `spawned {request, pane}`, after `pane_created`.
+
+`close` terminates the pane's process group and removes the pane; the reply is `done {request}`, after `pane_closed`. It is refused while another connection holds the pane's lease. Asking the user for confirmation is client UI. For compatibility with the composed UI, closing the last pane first creates a replacement shell, and the last pane's own exit stops the server.
+
+### Closed sessions (`closed-sessions`)
+
+```json
+{"Stream":{"type":"closed_sessions","request":"r3"}}
+{"Stream":{"type":"restore","request":"r4","record":"<key>","rerun":false}}
+```
+
+`closed_sessions` replies `closed_sessions {request, records}` once the existing background collection finishes (at most 256 records, newest first, from this workspace and sibling workspaces of the same user, seven-day retention). A record has `key`, `workspace`, `pane` (its old ID), `cwd`, `name`, `kind`, `session_id`, `argv`, `closed_at`, `reason`, and the derived `resume` (the agent resume command) and `rerun` (the program command line). `restore` addresses a record of the latest list by `key`; it resumes an agent conversation if known, reruns a program only with `rerun: true`, and otherwise opens a shell in the record's folder. The reply is `restored {request, record, pane, existing}`; `existing: true` means the conversation was already open in `pane` and nothing was started. A restored record is consumed. A conversation running in another workspace is refused.
+
+### History, search and scrolling (`pane-history`, `pane-scroll`)
+
+```json
+{"Stream":{"type":"history","request":"r5","pane":1,"start":-500,"limit":200}}
+{"Stream":{"type":"search","request":"r6","panes":[],"query":"error","limit":64}}
+```
+
+`history` returns `history {request, pane, lines}` with the same plain-text rows and relative line indices as the local `History` request (at most 200). `search` returns `search {request, results, truncated}`; each result is `{pane, hits, truncated}` with the same immutable-context matches as `SearchPane`. An empty `panes` list searches every pane in ID (creation) order. One reply holds at most `limit` (1–64) matches and 4 MiB of context; `truncated` reports that a limit stopped the search. Neither request needs a lease or changes any viewport.
+
+`scroll {pane, lines}` and `reveal {pane, line}` require the pane's lease and move its emulator viewport, which every subscriber of that pane sees in its snapshots. `reveal` takes a primary-history line (a `history` index, or a match's `first_line + start.y`) and fails while the application uses the alternate screen. They exist until styled history lets a client render scrollback itself.
+
+### Notifications, host status and server lifecycle
+
+`acknowledge_all` marks every retained notification read (`notification-ack-all`).
+
+`{"type":"host_status","enabled":true}` adds `host` to that connection's updates (`host-status`): per-CPU usage, memory and swap bytes, load, uptime, task counts, network and disk I/O rates, mounted disks and the process table, sampled on demand about once a second while at least one connection wants it. `ready` is false until the first sample. Views, sorting and formatting are client UI.
+
+`shutdown {request}` replies `done` and stops the server and its panes (`server-lifecycle`). A connection that enabled `session_events` receives `server_stopping {reason: "shutdown"|"last_pane_exited"}` before its socket closes; the server gives queued messages up to 200 ms. There is no upgrade event: a live server is never upgraded in place. A client detects a different server by its epoch and `server_version`, and its features by the capabilities.
+
+### Parking and hidden panes
+
+The server has no parking concept. A client that hides a pane unsubscribes from it and either keeps its lease, so its size stays fixed while hidden, or releases it, so the pane returns to the server's base geometry.
