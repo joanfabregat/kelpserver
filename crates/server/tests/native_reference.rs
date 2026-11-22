@@ -10,6 +10,10 @@ fn hello() -> Event {
         epoch: "unique-server-epoch".into(),
         capabilities: vec!["pane-patches".into()],
         server_version: None,
+        startup_panes: None,
+        recovery_pending: false,
+        limits: None,
+        notification_run: None,
     }
 }
 fn snapshot(pane: u64) -> PaneSnapshot {
@@ -96,6 +100,10 @@ fn epoch_handshake_and_missing_baseline_errors_are_transactional() {
                 epoch: "x".into(),
                 capabilities: vec![],
                 server_version: None,
+                startup_panes: None,
+                recovery_pending: false,
+                limits: None,
+                notification_run: None,
             })
             .is_err()
     );
@@ -199,7 +207,9 @@ fn duplicate_metadata_and_unsafe_cells_are_rejected_without_replacing_state() {
 fn standalone_lease_events_have_bounds_and_validate_known_membership_transactionally() {
     let mut empty = State::default();
     empty.apply(hello()).unwrap();
-    for pane in 1..=10 {
+    // Before any update, standalone leases are bounded by the pane limit.
+    let bound = stream::MAX_SUBSCRIPTIONS as u64;
+    for pane in 1..=bound {
         empty
             .apply(Event::Lease {
                 pane,
@@ -211,7 +221,7 @@ fn standalone_lease_events_have_bounds_and_validate_known_membership_transaction
     assert!(
         empty
             .apply(Event::Lease {
-                pane: 11,
+                pane: bound + 1,
                 owner: Some(5)
             })
             .is_err()

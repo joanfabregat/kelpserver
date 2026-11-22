@@ -1,6 +1,6 @@
 # Session API inventory
 
-This is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the inventory of what today's KelpMux TUI obtains from the composed protocol (local protocol 58), sorted by the boundary rule, and what the pane stream now carries so a TUI can run as a stream client with local rendering and local UI state. The wire contract is in [native-client-protocol.md](native-client-protocol.md#session-api); this page records the classification and the gaps.
+This is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the inventory of what today's KelpMux TUI obtains from the composed protocol (local protocol 58), sorted by the boundary rule, and what the pane stream now carries so a TUI can run as a stream client with local rendering and local UI state. The wire contract is in [native-client-protocol.md](native-client-protocol.md#session-api); this page records the classification and the gaps. The [step 2 server support](#step-2-server-support-2026-11-21) closes the gaps the stream TUI found; rows marked "Step 2" record it.
 
 "Session" means the server keeps it. "Client UI" means each client owns it, keyed by pane identity (server epoch plus pane ID), and the server stores none of it. "Before" is the stream protocol at `0837dd2`; "Step 1" is what this change adds. All additions are additive and capability-gated; the stream version stays 1.
 
@@ -13,18 +13,18 @@ This is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the inventory 
 | Pane created | Session | No (a new ID appeared in `Update.panes`) | `pane_created {session}` event. |
 | Pane exited (exit code or signal) | Session | No (`dead`/`Exited` status, briefly) | `pane_exited {pane, at, code, signal}` event. |
 | Pane closed (by exit or by a client), with its closed-session record | Session | No (the ID disappeared) | `pane_closed {pane, at, reason, record}` event. Events invalidate a pending update so the next update follows them. |
-| Create a pane (cwd, argv; sanitized environment) | Session | Only `SpawnPane` on a separate same-UID management connection, not through the SSH bridge | `spawn {request, cwd?, argv}` → `spawned {request, pane}`, same validation and retry cache as `SpawnPane`. The environment is sanitized by the server (session markers removed); clients cannot pass variables. |
+| Create a pane (cwd, argv; sanitized environment) | Session | Only `SpawnPane` on a separate same-UID management connection, not through the SSH bridge | `spawn {request, cwd?, argv}` → `spawned {request, pane}`, same validation and retry cache as `SpawnPane`. The environment is sanitized by the server (session markers removed); clients cannot pass variables. Step 2: optional `shell` (`spawn-shell`), part of the retry identity; `PaneSession.spawned_by` names the creating connection (`spawned-by`). |
 | Close (terminate) a pane | Session | No | `close {request, pane}` → `done {request}`; refused while another connection holds the lease. The confirmation dialog is client UI. |
 | Closed-session records: list | Session | No (composed Recovery dialog only) | `closed_sessions {request}` → `closed_sessions {request, records}`, collected by the existing background job. Records carry `key`, workspace, cwd, name, kind, session ID, argv, close time, reason, and the derived `resume` and `rerun` commands. |
 | Closed-session records: restore or rerun | Session | No | `restore {request, record, rerun}` → `restored {request, record, pane, existing}`. Records are addressed by `key`, never by a list index. |
 | Restore-choice labels, copy resume command | Client UI | n/a | Derived by the client from `resume`/`rerun`. |
-| Notifications feed (latest 128) | Session | Yes: `Update.notifications` | None. |
+| Notifications feed (latest 128) | Session | Yes: `Update.notifications` | None. Step 2: Welcome `notification_run` (`notification-run`), the run that notification origins are matched against. |
 | Acknowledge one notification | Session | Yes: `acknowledge` | None. |
 | Acknowledge all | Session | No | `acknowledge_all` (`notification-ack-all`). |
 | Notification sound, "next attention/finished" navigation, unread badges | Client UI | n/a | Computed from notifications and pane status. |
 | History | Session | No on the stream (`History` on a separate connection only) | `history {request, pane, start, limit}` → `history {request, pane, lines}` (plain text, at most 200 rows). |
 | Search one pane or across panes | Session | No on the stream (`SearchPane` on a separate connection only) | `search {request, panes, query, limit}` → `search {request, results, truncated}`; an empty pane list searches every pane in creation order; 64 matches and 4 MiB of context per reply. |
-| Scrollback viewing and revealing a search match | Session today (emulator viewport) | No | `scroll {pane, lines}` and `reveal {pane, line}`, both lease-bound (`pane-scroll`). See "Gaps" for styled history. |
+| Scrollback viewing and revealing a search match | Session today (emulator viewport) | No | `scroll {pane, lines}` and `reveal {pane, line}`, both lease-bound (`pane-scroll`). See "Remaining gaps" for styled history. |
 | Selection and copy | Client UI | Snapshots and OSC 52 `clipboard-write` | None: selection is computed on the client's own snapshot and history text. |
 | Terminal screen, patches, input, paste, mouse, resize, per-pane leases and sizes, controller theme | Session | Yes | None. |
 | Host vitals (CPU, memory, swap, disk %, clock) | Session (host observation) | Yes: `Update.vitals` | None. |
@@ -35,8 +35,11 @@ This is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the inventory 
 | Tabs, tab order, names, colours, focus and focus history, reading/grid modes, grid geometry, sidebar, dialogs, help, title animation, spinner, templates, TUI settings | Client UI | n/a | None. Tab order defaults to pane ID (creation) order; names start from `PaneInfo.title` / `PaneSession.terminal_title`. |
 | Parking | Client UI | n/a | None. The server needs no "parked" concept: see below. |
 | Scratch terminal | Client UI (which pane is "scratch") | n/a | None. A client creates it with `spawn` and marks it locally; for the server it is an ordinary pane. |
-| Agent conversation link (Codex picker) | Session (discovery input) | No | Not in step 1; see "Gaps". |
-| Unused-shell hint | Session (observation) | No (composed UI only) | Not in step 1; see "Gaps". |
+| Agent conversation link (Codex picker) | Session (discovery input) | No | Dropped: not planned (step 2 decision). |
+| Unused-shell hint | Session (observation) | No (composed UI only) | Step 2: `PaneSession.unused_shell` (`unused-shell`). |
+| Startup panes (composed startup tabs, `tab-layout.json`) | Session (startup policy); the layout itself is client UI | No | Step 2: `--startup-panes layout\|none` and Welcome `startup_panes` (`startup-policy`). |
+| Recovery popup after an unclean shutdown | Session (lifecycle signal); the popup is client UI | No (composed UI only) | Step 2: Welcome `recovery_pending` and `dismiss_recovery` (`recovery-signal`). |
+| Subscription bounds | Session (resource limits) | Hardcoded: 10 panes, 100,000 cells | Step 2: 64 panes, Welcome `limits` (`stream-limits`). |
 
 ## Parking and display leases
 
@@ -53,16 +56,29 @@ A dedicated "this client doesn't display this pane" request would duplicate `sub
 1. **Versioning.** The stream stays at version 1. Every addition is a new optional field or a new request/event type behind a new Welcome capability. Events of new types are sent only to a connection that opted in (`session_events`, `host_status`) or sent the correlated request, because current KelpClient and KelpHub decoders reject unknown event types. An older server disconnects on an unknown request type, so clients check capabilities first.
 2. **Correlation.** New request/reply operations carry a client-chosen `request` string (1–128 of `A–Z a–z 0–9 - _`), echoed in the reply and in `error.request`. Fire-and-forget operations (`scroll`, `reveal`, `acknowledge_all`, opt-ins) have none, like the v1 operations.
 3. **Lifecycle ordering.** Lifecycle events are reliable messages; a pending replaceable update built before an event is discarded together with that connection's screen baselines, so the next update is a fresh full update that already reflects the event.
-4. **Closing the last pane** keeps the composed protocol's policy for now: `close` on the last main pane first spawns a replacement shell (reported by `pane_created`), and the last pane's exit stops the server (`server_stopping {reason: last_pane_exited}`). Whether a session server may run with zero panes is a step 3 decision.
+4. **Closing the last pane** keeps the composed protocol's policy for now: `close` on the last main pane first spawns a replacement shell (reported by `pane_created`), and the last pane's exit stops the server (`server_stopping {reason: last_pane_exited}`). A server started with `--startup-panes none` runs with zero panes (decision 8); whether `close` may also leave zero panes is a step 3 decision.
 5. **Closed-session records stay in the server** and stay generic: they are derived from server observations (foreground programs, agent sessions), shared by every client, and restored by opaque `key`. Only their presentation is client UI.
 6. **Scroll stays a lease-bound server operation in step 1** because local rendering of scrollback needs styled history, which does not exist yet.
 7. **Host status data stays in the server** (`status.rs` sampling); its presentation (views, sorting, columns, formatting) is client UI.
+8. **Zero panes (step 2).** A server started with `--startup-panes none` runs with zero panes until a client spawns; nothing in the server needs a pane, and only the last pane's exit stops it. `close` on the last pane still creates a replacement shell first, so a running server never drops back to zero panes through `close`.
+9. **Unused shell is an observation, recovery is a lifecycle signal (step 2).** Both are derived from server state and useful to any client; the hint's presentation and the recovery popup stay client UI. Neither depends on leases or on which client asked.
+10. **Subscription bounds (step 2).** The pane bound rose from 10 to 64; the 100,000-cell bound stays, because a backpressured update carries every subscribed screen in one record capped at 16 MiB (about 100–160 JSON bytes per cell), and a grid on one terminal never covers more than that terminal (at most 64,000 cells). Hidden panes are unsubscribed rather than counted.
 
-## Gaps for step 2
+## Step 2 server support (2026-11-21)
 
-- **Styled history.** `history` returns plain text. A locally rendered scrollback with colours needs paged rows of cells with stable row anchors (ADR 0001, "Terminal history and synchronization"). Until then, a TUI scrolls with `scroll`/`reveal` and renders the scrolled snapshot.
-- **Agent conversation link.** The Codex conversation picker (`AgentLinkPicker`/`AgentLinkChoose`) lists sessions through the discovery worker and binds one to a pane. A stream version would be `agent_sessions {request, pane}` and `link_agent {request, pane, session}`.
-- **Unused-shell hint.** The composed UI marks shells that have no child process and no recent input. It could become an observation field (for example `PaneSession.idle_shell`); a client can approximate it with `status == idle` and no `command`.
-- **Spawn with another shell.** Templates may name a shell; `spawn` uses the server's shell (a template can still run a program through `argv`).
-- **Initial panes.** The server still creates the composed grid's initial panes and restores `tab-layout.json` on start. A stream TUI restores its own layout by spawning; the server's startup policy changes in step 3.
+These gaps found by the stream TUI are closed, each behind its own capability (contract in [native-client-protocol.md](native-client-protocol.md#step-2-additions)):
+
+- **Initial panes** (`startup-policy`): `--startup-panes none` starts without panes and leaves the composed UI's `tab-layout.json` and saved tab count untouched; Welcome `startup_panes` reports the policy.
+- **Recovery popup** (`recovery-signal`): Welcome `recovery_pending` after an unclean shutdown, cleared for every client by `dismiss_recovery` or by the composed popup.
+- **Spawn with another shell** (`spawn-shell`): `spawn {shell}`, validated like the workspace shell and part of the retry identity.
+- **Unused-shell hint** (`unused-shell`): `PaneSession.unused_shell`, the composed UI's logic and rate limits, sampled while a `session_events` connection is attached.
+- **Subscription limit** (`stream-limits`): 64 panes, 100,000 cells, advertised in Welcome `limits`.
+- **Notification run** (`notification-run`): Welcome `notification_run`, the run that notification `origin.run` is compared with, so a client matches notifications to live panes like the composed UI instead of guessing the run.
+- **Pane creator** (`spawned-by`): `PaneSession.spawned_by`, the Welcome `client` ID of the connection whose `spawn` or `restore` created the pane; kept for the epoch only.
+
+## Remaining gaps
+
+- **Styled history.** `history` returns plain text. A locally rendered scrollback with colours needs paged rows of cells with stable row anchors (ADR 0001, "Terminal history and synchronization"). Until then, a TUI scrolls with `scroll`/`reveal` and renders the scrolled snapshot. Not planned for step 2.
+- **Agent conversation link.** The Codex conversation picker (`AgentLinkPicker`/`AgentLinkChoose`) is dropped from the stream TUI; no stream request is planned.
 - **Diagnostics** remain a separate same-UID management request.
+

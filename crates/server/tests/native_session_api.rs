@@ -2,7 +2,7 @@
 use kelpserver::native::{
     protocol::*,
     server::{ServerConfig, serve},
-    stream::{self, CloseReason, Event, PaneSnapshot, Request, StopReason, Update},
+    stream::{self, CloseReason, Event, PaneSnapshot, Request, StartupPanes, StopReason, Update},
 };
 use std::{
     collections::BTreeMap,
@@ -23,6 +23,9 @@ impl Daemon {
     }
     /// `prepare` may seed the private state directory before the server starts.
     fn start_with(prepare: impl FnOnce(&std::path::Path)) -> Self {
+        Self::start_policy(prepare, StartupPanes::Layout)
+    }
+    fn start_policy(prepare: impl FnOnce(&std::path::Path), startup_panes: StartupPanes) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "kelpserver-session-{}-{}",
@@ -46,6 +49,7 @@ impl Daemon {
             ui: Default::default(),
             initial_grid: (2, 1),
             initial_tabs: None,
+            startup_panes,
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {
@@ -72,6 +76,7 @@ impl Daemon {
             epoch: String::new(),
             capabilities: Vec::new(),
             server_version: None,
+            welcome: None,
             update: None,
             screens: BTreeMap::new(),
         };
@@ -79,14 +84,16 @@ impl Daemon {
             version: stream::VERSION,
         });
         loop {
+            let event = p.next();
             if let Event::Welcome {
                 client,
                 epoch,
                 capabilities,
                 server_version,
                 ..
-            } = p.next()
+            } = event.clone()
             {
+                p.welcome = Some(event);
                 p.id = client;
                 p.epoch = epoch;
                 p.capabilities = capabilities;
@@ -132,10 +139,32 @@ struct Peer {
     epoch: String,
     capabilities: Vec<String>,
     server_version: Option<String>,
+    welcome: Option<Event>,
     update: Option<Update>,
     screens: BTreeMap<u64, PaneSnapshot>,
 }
 impl Peer {
+    /// Welcome's step 2 fields: startup policy, recovery signal, limits and
+    /// notification run.
+    fn welcome_fields(
+        &self,
+    ) -> (
+        Option<StartupPanes>,
+        bool,
+        Option<stream::Limits>,
+        Option<String>,
+    ) {
+        match self.welcome.clone().unwrap() {
+            Event::Welcome {
+                startup_panes,
+                recovery_pending,
+                limits,
+                notification_run,
+                ..
+            } => (startup_panes, recovery_pending, limits, notification_run),
+            _ => unreachable!(),
+        }
+    }
     fn send(&mut self, r: Request) {
         write_message(&mut self.socket, &ClientMessage::Stream(r)).unwrap();
     }
@@ -207,6 +236,7 @@ impl Peer {
             request: request.into(),
             cwd: None,
             argv: argv.iter().map(|a| (*a).into()).collect(),
+            shell: None,
         });
         self.until(|event| match event {
             Event::Spawned { request: r, pane } if r == request => Some(*pane),
@@ -322,6 +352,7 @@ fn spawn_and_close_emit_ordered_lifecycle_events_with_session_data() {
             "-c".into(),
             "echo SPAWNED; exec sleep 300".into(),
         ],
+        shell: None,
     });
     let mut created = None;
     let mut spawned = None;
@@ -365,6 +396,7 @@ fn spawn_and_close_emit_ordered_lifecycle_events_with_session_data() {
         request: "spawn-1".into(),
         cwd: None,
         argv: vec![],
+        shell: None,
     });
     assert!(message.contains("different parameters"), "{message}");
     assert_eq!(request.as_deref(), Some("spawn-1"));
@@ -803,4 +835,337 @@ fn new_requests_require_hello() {
     peer.send(Request::Subscribe { panes: vec![1] });
     peer.screen_until(1, |_| true);
     assert_eq!(daemon.inspect(1).cols, peer.screens[&1].screen.cols);
+}
+
+// Step 2 server support (ADR 0002): startup policy, recovery signal, spawn
+// shell, unused-shell and spawned-by observations, limits, notification run.
+
+/// Attach the composed protocol and return its first full frame.
+fn composed_frame(daemon: &Daemon) -> (UnixStream, Frame) {
+    let mut tui = daemon.socket();
+    write_message(
+        &mut tui,
+        &ClientMessage::Attach {
+            version: VERSION,
+            cols: 120,
+            rows: 40,
+            takeover: false,
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no composed frame");
+        match read_message::<ServerMessage>(&mut tui)
+            .unwrap()
+            .expect("disconnected")
+        {
+            ServerMessage::Frame(frame) => return (tui, frame),
+            ServerMessage::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+}
+fn private_file(path: &std::path::Path, contents: &[u8]) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn welcome_advertises_step2_capabilities_limits_and_notification_run() {
+    let daemon = Daemon::start();
+    let peer = daemon.peer();
+    for capability in [
+        "startup-policy",
+        "recovery-signal",
+        "spawn-shell",
+        "unused-shell",
+        "stream-limits",
+        "notification-run",
+        "spawned-by",
+    ] {
+        assert!(
+            peer.capabilities.iter().any(|c| c == capability),
+            "{capability}"
+        );
+    }
+    let (startup, recovery, limits, run) = peer.welcome_fields();
+    assert_eq!(startup, Some(StartupPanes::Layout));
+    assert!(!recovery, "a first run is clean");
+    assert_eq!(limits, Some(stream::LIMITS));
+    assert!(
+        limits.is_some_and(|l| l.subscriptions >= 24),
+        "a 24-pane grid fits"
+    );
+    // It is the run the composed UI matches notification origins against.
+    let (_tui, frame) = composed_frame(&daemon);
+    assert!(!frame.ui.notification_run.is_empty());
+    assert_eq!(run.as_deref(), Some(frame.ui.notification_run.as_str()));
+    // A clean run omits the recovery field from the wire.
+    let json = serde_json::to_value(peer.welcome.as_ref().unwrap()).unwrap();
+    assert!(json.get("recovery_pending").is_none(), "{json}");
+    assert_eq!(json["startup_panes"], "layout");
+}
+
+#[test]
+fn startup_policy_parses_only_known_values() {
+    assert_eq!(
+        "layout".parse::<StartupPanes>().unwrap(),
+        StartupPanes::Layout
+    );
+    assert_eq!("none".parse::<StartupPanes>().unwrap(), StartupPanes::None);
+    assert!("zero".parse::<StartupPanes>().is_err());
+    assert_eq!(StartupPanes::default(), StartupPanes::Layout);
+}
+
+/// With `none`, a stream client owns the initial layout: the server starts
+/// with no pane, stays usable, and leaves the composed UI's saved tab layout
+/// and tab count alone.
+#[test]
+fn startup_panes_none_starts_empty_and_keeps_the_saved_layout() {
+    let layout = br#"{"seeded":"composed tab layout"}"#;
+    let daemon = Daemon::start_policy(
+        |state| {
+            private_file(&state.join("tab-layout.json"), layout);
+            private_file(&state.join("workspace.json"), br#"{"tab_count":3}"#);
+        },
+        StartupPanes::None,
+    );
+    let state = daemon.root.join("state");
+    let mut peer = daemon.peer();
+    assert_eq!(peer.welcome_fields().0, Some(StartupPanes::None));
+    peer.send(Request::SessionEvents { enabled: true });
+    peer.send(Request::Subscribe { panes: vec![] });
+    let first = peer.update_until(|_| true);
+    assert!(first.panes.is_empty(), "{:?}", first.panes);
+    assert!(first.sessions.is_empty());
+    // The composed UI still renders an empty workspace without panicking.
+    let (tui, frame) = composed_frame(&daemon);
+    assert!(frame.panes.is_empty());
+    drop(tui);
+
+    let a = peer.spawn("none-1", &[]);
+    let b = peer.spawn("none-2", &[]);
+    assert_eq!((a, b), (1, 2), "the client's panes are the first ones");
+    peer.send(Request::Subscribe { panes: vec![a, b] });
+    peer.screen_until(b, |_| true);
+    peer.send(Request::Close {
+        request: "none-3".into(),
+        pane: a,
+    });
+    peer.until(|e| matches!(e, Event::Done { request } if request == "none-3").then_some(()));
+    assert_eq!(fs::read(state.join("tab-layout.json")).unwrap(), layout);
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("workspace.json")).unwrap()).unwrap();
+    assert_eq!(settings["tab_count"], 3, "{settings}");
+}
+
+#[test]
+fn recovery_signal_is_shared_and_dismissable() {
+    let unclean =
+        |state: &std::path::Path| private_file(&state.join("server.running.json"), b"true");
+
+    // A stream client sees the signal and dismisses it for everyone.
+    let daemon = Daemon::start_with(unclean);
+    let mut peer = daemon.peer();
+    assert!(peer.welcome_fields().1);
+    let json = serde_json::to_value(peer.welcome.as_ref().unwrap()).unwrap();
+    assert_eq!(json["recovery_pending"], true);
+    peer.send(Request::DismissRecovery {
+        request: "recovery-1".into(),
+    });
+    peer.until(|e| matches!(e, Event::Done { request } if request == "recovery-1").then_some(()));
+    assert!(!daemon.peer().welcome_fields().1);
+    let (_tui, frame) = composed_frame(&daemon);
+    assert!(frame.ui.dialog.is_none(), "{:?}", frame.ui.dialog);
+    drop(daemon);
+
+    // The composed UI's popup consumes the same signal.
+    let daemon = Daemon::start_with(unclean);
+    let (_tui, frame) = composed_frame(&daemon);
+    assert!(
+        frame
+            .ui
+            .dialog
+            .is_some_and(|d| d.kind == kelpserver::native::ui::DialogKind::Recovery)
+    );
+    assert!(!daemon.peer().welcome_fields().1);
+}
+
+#[test]
+fn spawn_accepts_only_a_valid_shell() {
+    let daemon = Daemon::start();
+    let shell = ["/bin/bash", "/usr/bin/bash", "/bin/dash", "/usr/bin/dash"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("a second shell");
+    let mut peer = daemon.peer();
+    peer.send(Request::SessionEvents { enabled: true });
+    let spawn = |request: &str, shell: Option<PathBuf>| Request::Spawn {
+        request: request.into(),
+        cwd: None,
+        argv: vec![],
+        shell,
+    };
+    peer.send(spawn("shell-1", Some(shell.clone())));
+    let pane = peer.until(|e| match e {
+        Event::Spawned { request, pane } if request == "shell-1" => Some(*pane),
+        _ => None,
+    });
+    let update = peer.update_until(|u| u.sessions.iter().any(|s| s.pane == pane));
+    let session = update.sessions.iter().find(|s| s.pane == pane).unwrap();
+    assert_eq!(session.shell, shell.to_string_lossy());
+
+    // The shell is part of the retry identity.
+    peer.send(spawn("shell-1", Some(shell.clone())));
+    let again = peer.until(|e| match e {
+        Event::Spawned { request, pane } if request == "shell-1" => Some(*pane),
+        _ => None,
+    });
+    assert_eq!(again, pane);
+    let (message, _) = peer.error(spawn("shell-1", None));
+    assert!(message.contains("different parameters"), "{message}");
+
+    let plain = daemon.root.join("not-executable");
+    private_file(&plain, b"#!/bin/sh\n");
+    for (index, bad) in [
+        PathBuf::from("sh"),
+        daemon.root.join("missing-shell"),
+        plain,
+        daemon.root.clone(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = format!("bad-shell-{index}");
+        let (message, failed) = peer.error(spawn(&request, Some(bad.clone())));
+        assert!(message.contains("shell"), "{bad:?}: {message}");
+        assert_eq!(failed.as_deref(), Some(request.as_str()));
+    }
+    // Without a shell, the request serializes as before.
+    let json = serde_json::to_value(spawn("x", None)).unwrap();
+    assert!(json.get("shell").is_none(), "{json}");
+}
+
+#[test]
+fn unused_shell_is_observed_for_session_event_clients() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    peer.send(Request::SessionEvents { enabled: true });
+    peer.update_until(|u| u.sessions.iter().any(|s| s.pane == 1 && s.unused_shell));
+    // Holding the lease does not hide the observation from its owner.
+    peer.send(Request::Subscribe { panes: vec![1] });
+    peer.lease(1);
+    peer.send(Request::Input {
+        pane: 1,
+        bytes: b"sleep 300\n".to_vec(),
+    });
+    peer.update_until(|u| u.sessions.iter().any(|s| s.pane == 1 && !s.unused_shell));
+}
+
+#[test]
+fn sessions_record_the_spawning_connection() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let mut other = daemon.peer();
+    assert_ne!(peer.id, other.id);
+    peer.send(Request::SessionEvents { enabled: true });
+    let mine = peer.spawn("by-1", &[]);
+    let theirs = other.spawn("by-2", &[]);
+    let update = peer.update_until(|u| u.sessions.iter().any(|s| s.pane == theirs));
+    let by = |pane: u64| {
+        update
+            .sessions
+            .iter()
+            .find(|s| s.pane == pane)
+            .unwrap()
+            .spawned_by
+    };
+    assert_eq!(by(1), None, "startup panes have no creator");
+    assert_eq!(by(mine), Some(peer.id));
+    assert_eq!(by(theirs), Some(other.id));
+    let startup = update.sessions.iter().find(|s| s.pane == 1).unwrap();
+    let json = serde_json::to_value(startup).unwrap();
+    assert!(json.get("spawned_by").is_none(), "{json}");
+}
+
+#[test]
+fn more_than_ten_panes_fit_the_advertised_subscription_limit() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let mut panes = vec![1, 2];
+    for index in 0..10 {
+        panes.push(peer.spawn(&format!("grid-{index}"), &[]));
+    }
+    peer.send(Request::Subscribe {
+        panes: panes.clone(),
+    });
+    let update = peer.update_until(|u| u.subscribed.len() == panes.len());
+    assert_eq!(update.snapshots.len(), panes.len());
+    // The reference client accepts the same update.
+    let mut state = kelpserver::native::reference::State::default();
+    state.apply(peer.welcome.clone().unwrap()).unwrap();
+    state.apply(Event::Update(update)).unwrap();
+    assert_eq!(state.screens.len(), panes.len());
+
+    let too_many = vec![1; stream::MAX_SUBSCRIPTIONS + 1];
+    let (message, _) = peer.error(Request::Subscribe { panes: too_many });
+    assert!(message.contains("invalid pane subscriptions"), "{message}");
+}
+
+/// `kelpserver start --startup-panes none` forwards the policy to the
+/// background server it launches.
+#[test]
+fn start_forwards_the_startup_policy() {
+    let root =
+        std::env::temp_dir().join(format!("kelpserver-session-start-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let state = root.join("state");
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_kelpserver"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "start",
+        "--shell",
+        "/bin/sh",
+        "--cwd",
+        root.to_str().unwrap(),
+        "--startup-panes",
+        "none",
+    ]);
+    let mut socket = UnixStream::connect(state.join("control.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write_message(
+        &mut socket,
+        &ClientMessage::Stream(Request::Hello {
+            version: stream::VERSION,
+        }),
+    )
+    .unwrap();
+    let startup = match read_message::<ServerMessage>(&mut socket).unwrap().unwrap() {
+        ServerMessage::Stream(Event::Welcome { startup_panes, .. }) => startup_panes,
+        other => panic!("{other:?}"),
+    };
+    drop(socket);
+    run(&["stop"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.join("control.sock").exists() {
+        assert!(Instant::now() < deadline, "server did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(startup, Some(StartupPanes::None));
+    let _ = fs::remove_dir_all(&root);
 }

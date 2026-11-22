@@ -179,6 +179,8 @@ pub struct StartRequest<'a> {
     pub settings: &'a Settings,
     pub replace_running: bool,
     pub executable: Option<&'a Path>,
+    /// Forwarded to the server; not persisted in `workspace.json`.
+    pub startup_panes: super::stream::StartupPanes,
 }
 pub fn start(request: StartRequest<'_>) -> Result<()> {
     private_state(request.state)?;
@@ -280,7 +282,7 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
     // The server and its panes start clean of the starter's agent and
     // multiplexer session markers (a start from inside Claude Code or tmux).
     super::shell::remove_session_markers(&mut command);
-    let mut child = command
+    command
         .arg("server")
         .arg("--background")
         .arg("--socket")
@@ -294,7 +296,15 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
         .arg("--size")
         .arg(size)
         .arg("--config")
-        .arg(request.state.join("workspace.json"))
+        .arg(request.state.join("workspace.json"));
+    // Only a non-default policy is passed, so a selected older server binary
+    // without `--startup-panes` still starts with its default behavior.
+    if request.startup_panes != super::stream::StartupPanes::Layout {
+        command
+            .arg("--startup-panes")
+            .arg(request.startup_panes.as_str());
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

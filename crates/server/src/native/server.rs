@@ -35,6 +35,8 @@ pub struct ServerConfig {
     pub ui: super::ui::UiConfig,
     pub initial_grid: (u8, u8),
     pub initial_tabs: Option<usize>,
+    /// `None` starts without panes and leaves the saved tab layout alone.
+    pub startup_panes: super::stream::StartupPanes,
 }
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
@@ -127,6 +129,19 @@ fn launch_folder(requested: &Path, workspace: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// A client-selected shell passes the same checks as the workspace shell at
+/// `start`: an absolute path to an existing executable regular file.
+fn valid_shell(shell: &Path) -> Result<()> {
+    if !shell.is_absolute() || shell.as_os_str().len() > 4096 {
+        return Err("shell must be an absolute path".into());
+    }
+    let meta = fs::metadata(shell).map_err(|e| format!("shell {}: {e}", shell.display()))?;
+    if !meta.is_file() || meta.mode() & 0o111 == 0 {
+        return Err("shell must be an executable file".into());
+    }
+    Ok(())
+}
+
 struct NativePane {
     launch_cwd: PathBuf,
     launch_shell: PathBuf,
@@ -146,6 +161,8 @@ struct NativePane {
     startup: Option<String>,
     argv: Vec<String>,
     exit: Option<(Option<i32>, Option<i32>)>,
+    /// The stream connection whose request created this pane.
+    spawned_by: Option<u64>,
 }
 impl NativePane {
     fn spawn(
@@ -244,6 +261,7 @@ impl NativePane {
             startup: startup.map(str::to_owned),
             argv: Vec::new(),
             exit: None,
+            spawned_by: None,
         };
         pane.start = process::read(Path::new("/proc"), pane.child.id())?.start;
         let fd = pane.master.as_raw_fd();
@@ -632,7 +650,11 @@ impl Drop for RecoveryJob {
     }
 }
 struct Server {
-    spawn_requests: BTreeMap<String, (PaneId, PathBuf, Vec<String>)>,
+    /// Retry cache of creation requests: pane, directory, arguments, shell.
+    spawn_requests: BTreeMap<String, (PaneId, PathBuf, Vec<String>, Option<PathBuf>)>,
+    /// Unused shells for `PaneSession::unused_shell`, sampled only while a
+    /// stream connection has `session_events` enabled.
+    unused_shells: std::collections::BTreeSet<PaneId>,
     /// Closed-session records last listed for stream clients; `restore` looks
     /// records up here so it never depends on the composed UI's list indices.
     records: Vec<super::history::Entry>,
@@ -731,6 +753,8 @@ impl Server {
             argv: pane.argv.clone(),
             startup: pane.startup.clone(),
             terminal_title: pane.terminal_title.clone(),
+            unused_shell: self.unused_shells.contains(&id),
+            spawned_by: pane.spawned_by,
         })
     }
     /// Deliver a lifecycle event to every connection that opted in. A pending
@@ -784,11 +808,15 @@ impl Server {
         });
     }
     /// Shared by `SpawnPane` administration and the stream `spawn` request.
+    /// `shell` replaces the server's shell; `spawned_by` is the requesting
+    /// stream connection.
     fn spawn_requested(
         &mut self,
         request: &str,
         cwd: PathBuf,
         argv: Vec<String>,
+        shell: Option<PathBuf>,
+        spawned_by: Option<u64>,
     ) -> Result<PaneId> {
         if !super::stream::valid_request(request)
             || !cwd.is_absolute()
@@ -799,12 +827,17 @@ impl Server {
         {
             return Err("invalid pane creation request".into());
         }
+        if let Some(shell) = &shell {
+            valid_shell(shell)?;
+        }
         let cwd = cwd.canonicalize()?;
         if !cwd.is_dir() {
             return Err("working directory must be a directory".into());
         }
-        if let Some((pane, previous_cwd, previous_argv)) = self.spawn_requests.get(request) {
-            if previous_cwd != &cwd || previous_argv != &argv {
+        if let Some((pane, previous_cwd, previous_argv, previous_shell)) =
+            self.spawn_requests.get(request)
+        {
+            if previous_cwd != &cwd || previous_argv != &argv || previous_shell != &shell {
                 return Err("creation request was already used with different parameters".into());
             }
             if !self.panes.contains_key(pane) {
@@ -823,17 +856,18 @@ impl Server {
             Some(super::templates::TemplatePane {
                 name: "shell".into(),
                 cwd: cwd.clone(),
-                shell: None,
+                shell: shell.clone(),
             }),
             startup.as_deref(),
             argv.clone(),
+            spawned_by,
         )?;
         self.aliases.remove(&pane);
         if self.spawn_requests.len() >= 512 {
             self.spawn_requests.pop_first();
         }
         self.spawn_requests
-            .insert(request.to_owned(), (pane, cwd, argv));
+            .insert(request.to_owned(), (pane, cwd, argv, shell));
         self.resize();
         self.dirty = true;
         Ok(pane)
@@ -844,6 +878,20 @@ impl Server {
             if version != super::stream::VERSION {
                 return Err("unsupported stream protocol version".into());
             }
+            let welcome = Event::Welcome {
+                version,
+                client: id,
+                epoch: self.epoch.clone(),
+                capabilities: super::stream::CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).into())
+                    .collect(),
+                server_version: Some(env!("CARGO_PKG_VERSION").into()),
+                startup_panes: Some(self.config.startup_panes),
+                recovery_pending: self.recovery_pending,
+                limits: Some(super::stream::LIMITS),
+                notification_run: Some(self.activity.run().to_owned()),
+            };
             let client = self.clients.get_mut(&id).unwrap();
             if client.attached || client.stream.is_some() {
                 return Err("connection already initialized".into());
@@ -856,16 +904,7 @@ impl Server {
                 previous: BTreeMap::new(),
                 metadata: None,
             });
-            client.send(ServerMessage::Stream(Event::Welcome {
-                version,
-                client: id,
-                epoch: self.epoch.clone(),
-                capabilities: super::stream::CAPABILITIES
-                    .iter()
-                    .map(|s| (*s).into())
-                    .collect(),
-                server_version: Some(env!("CARGO_PKG_VERSION").into()),
-            }))?;
+            client.send(ServerMessage::Stream(welcome))?;
             self.dirty = true;
             return Ok(());
         }
@@ -1078,10 +1117,20 @@ impl Server {
                 stream.host = enabled;
                 stream.metadata = None;
             }
-            Request::Spawn { request, cwd, argv } => {
+            Request::Spawn {
+                request,
+                cwd,
+                argv,
+                shell,
+            } => {
                 let cwd = cwd.unwrap_or_else(|| self.config.cwd.clone());
-                let pane = self.spawn_requested(&request, cwd, argv)?;
+                let pane = self.spawn_requested(&request, cwd, argv, shell, Some(id))?;
                 self.reply(id, Event::Spawned { request, pane })?;
+            }
+            Request::DismissRecovery { request } => {
+                // One shared signal: the composed UI's popup is dismissed too.
+                self.recovery_pending = false;
+                self.reply(id, Event::Done { request })?;
             }
             Request::Close { request, pane } => {
                 if !self.panes.contains_key(&pane) {
@@ -1116,7 +1165,7 @@ impl Server {
                     .find(|entry| entry.key == record)
                     .cloned()
                     .ok_or("unknown closed-session record; list closed sessions again")?;
-                let (pane, existing, _) = self.restore_record(&entry, rerun)?;
+                let (pane, existing, _) = self.restore_record(&entry, rerun, Some(id))?;
                 self.resize();
                 self.persist_geometry()?;
                 self.reply(
@@ -1429,6 +1478,11 @@ impl Server {
             self.workspace.ui.row_weights.clone(),
         ];
         settings.template = self.config.template.clone();
+        if self.config.startup_panes == super::stream::StartupPanes::None {
+            // A stream client owns this run's panes; keep the composed UI's
+            // saved tab layout and tab count for its next startup.
+            return journal::atomic(&path, &settings);
+        }
         let layout = self
             .remember_tab_order
             .then(|| super::lifecycle::TabLayout {
@@ -1969,6 +2023,7 @@ impl Server {
         self.aliases.remove(&id);
         self.workspace.ui.config.pane_colors.remove(&id);
         self.workspace.ui.unused.retain(|pane| *pane != id);
+        self.unused_shells.remove(&id);
         // Return to the previously focused tab; without one, the first.
         let fallback = self
             .workspace
@@ -2043,7 +2098,7 @@ impl Server {
         self.spawn_pane(specification)
     }
     fn spawn_pane(&mut self, specification: Option<super::templates::TemplatePane>) -> Result<()> {
-        self.spawn_pane_command(specification, None, Vec::new())
+        self.spawn_pane_command(specification, None, Vec::new(), None)
     }
     /// The session half of restoring a closed-session record, shared by the
     /// composed UI and the stream `restore` request. Returns the pane, whether
@@ -2052,6 +2107,7 @@ impl Server {
         &mut self,
         entry: &super::history::Entry,
         rerun: bool,
+        spawned_by: Option<u64>,
     ) -> Result<(PaneId, bool, bool)> {
         let cwd = PathBuf::from(&entry.cwd);
         let command = entry
@@ -2109,6 +2165,7 @@ impl Server {
                 }),
                 command.as_deref(),
                 Vec::new(),
+                spawned_by,
             )?;
             let id = self.workspace.panes.last().unwrap().id;
             self.aliases.remove(&id);
@@ -2130,7 +2187,7 @@ impl Server {
         Ok((id, existing.is_some(), moved))
     }
     fn reopen_tab(&mut self, entry: super::history::Entry, rerun: bool) -> Result<()> {
-        let (id, existing, moved) = self.restore_record(&entry, rerun)?;
+        let (id, existing, moved) = self.restore_record(&entry, rerun, None)?;
         if existing {
             if self
                 .workspace
@@ -2176,6 +2233,7 @@ impl Server {
         specification: Option<super::templates::TemplatePane>,
         startup: Option<&str>,
         argv: Vec<String>,
+        spawned_by: Option<u64>,
     ) -> Result<()> {
         let id = self.next_pane;
         let original_cwd = self.config.cwd.clone();
@@ -2213,6 +2271,7 @@ impl Server {
         self.config.shell = original_shell;
         let mut pane = pane?;
         pane.argv = argv;
+        pane.spawned_by = spawned_by;
         pane.terminal.set_theme(self.terminal_theme());
         let title = specification
             .as_ref()
@@ -2300,7 +2359,7 @@ impl Server {
                 if self.clients[&id].attached && self.controller != Some(id) {
                     return Err("observers cannot create panes".into());
                 }
-                let pane = self.spawn_requested(&request, cwd, argv)?;
+                let pane = self.spawn_requested(&request, cwd, argv, None, None)?;
                 self.clients
                     .get_mut(&id)
                     .unwrap()
@@ -3533,6 +3592,7 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
         controller: None,
         next_pane: 1,
         spawn_requests: BTreeMap::new(),
+        unused_shells: Default::default(),
         records: Vec::new(),
         recovery_waiters: Vec::new(),
         recovery_for_ui: false,
@@ -3546,10 +3606,19 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
         .history
         .save(&server.config.state_dir.join("tab-history.json"))?;
     server.workspace.ui.notification_run = server.activity.run().into();
-    let count = server.config.initial_tabs.unwrap_or(
-        usize::from(server.config.initial_grid.0) * usize::from(server.config.initial_grid.1),
-    );
-    let layout =
+    // `--startup-panes none`: the stream client that started the server owns
+    // the initial layout and creates it with `spawn`. Nothing in the server
+    // needs a pane: the composed UI renders an empty workspace, and the last
+    // pane's exit, not an empty pane list, stops the server.
+    let startup_layout = server.config.startup_panes == super::stream::StartupPanes::Layout;
+    let count = if startup_layout {
+        server.config.initial_tabs.unwrap_or(
+            usize::from(server.config.initial_grid.0) * usize::from(server.config.initial_grid.1),
+        )
+    } else {
+        0
+    };
+    let layout = if startup_layout {
         super::lifecycle::TabLayout::load(&server.config.state_dir.join("tab-layout.json"))
             .ok()
             .filter(|layout| {
@@ -3557,7 +3626,10 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
                     && layout.template == server.config.template
                     && layout.cwd == server.config.cwd
                     && layout.shell == server.config.shell
-            });
+            })
+    } else {
+        None
+    };
     server.remember_tab_order = layout.is_some();
     for index in 0..count {
         let result = if let Some(saved) = layout.as_ref().and_then(|layout| layout.panes.get(index))
@@ -3580,7 +3652,7 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
             eprintln!("kelpmux: skipping startup tab {}: {e}", index + 1);
         }
     }
-    if server.workspace.panes.is_empty() {
+    if startup_layout && server.workspace.panes.is_empty() {
         // Like closing the last tab, startup always leaves one interactive shell.
         server.spawn_pane(None)?;
     }
@@ -3645,7 +3717,15 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
             .clients
             .values()
             .any(|client| client.stream.is_some());
-        let idle_interval = if attached {
+        // Stream clients with session events get the same unused-shell
+        // observation as the attached UI, under the same rate limits.
+        let session_streaming = server.clients.values().any(|client| {
+            client
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.session_events)
+        });
+        let idle_interval = if attached || session_streaming {
             Duration::from_millis(100)
         } else {
             Duration::from_secs(1)
@@ -3658,25 +3738,38 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
             }
             idle_poll = Instant::now();
         }
-        // This process-table scan only supplies the attached UI's unused-shell
-        // hints. Never scan the whole host ten times a second per workspace.
-        if attached && unused_poll.elapsed() >= Duration::from_millis(500) {
+        if !session_streaming && !server.unused_shells.is_empty() {
+            // Nobody receives the observation; never deliver a stale one later.
+            server.unused_shells.clear();
+        }
+        // This process-table scan only supplies unused-shell hints. Never scan
+        // the whole host ten times a second per workspace.
+        if (attached || session_streaming) && unused_poll.elapsed() >= Duration::from_millis(500) {
             if let Ok(tree) = process::snapshot(Path::new("/proc")) {
-                let unused: Vec<_> = server
-                    .workspace
+                let unused: std::collections::BTreeSet<PaneId> = server
                     .panes
                     .iter()
-                    .filter(|info| {
-                        !server.leases.contains_key(&info.id)
-                            && server
-                                .panes
-                                .get(&info.id)
-                                .is_some_and(|pane| pane.unused(&tree))
-                    })
-                    .map(|info| info.id)
+                    .filter(|(_, pane)| pane.unused(&tree))
+                    .map(|(id, _)| *id)
                     .collect();
-                if unused != server.workspace.ui.unused {
-                    server.workspace.ui.unused = unused;
+                if attached {
+                    // The composed UI leaves panes a stream client leases alone.
+                    let hints: Vec<_> = server
+                        .workspace
+                        .panes
+                        .iter()
+                        .filter(|info| {
+                            !server.leases.contains_key(&info.id) && unused.contains(&info.id)
+                        })
+                        .map(|info| info.id)
+                        .collect();
+                    if hints != server.workspace.ui.unused {
+                        server.workspace.ui.unused = hints;
+                        server.dirty = true;
+                    }
+                }
+                if session_streaming && unused != server.unused_shells {
+                    server.unused_shells = unused;
                     server.dirty = true;
                 }
             }

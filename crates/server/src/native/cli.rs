@@ -18,6 +18,7 @@ struct Options {
     command: Vec<String>,
     background: bool,
     settings: super::lifecycle::Settings,
+    startup_panes: super::stream::StartupPanes,
 }
 fn options(args: &[String]) -> Result<Options> {
     let state = super::lifecycle::workspace_path("main")?;
@@ -34,6 +35,7 @@ fn options(args: &[String]) -> Result<Options> {
         command: vec![],
         background: false,
         settings: super::lifecycle::Settings::default(),
+        startup_panes: Default::default(),
     };
     let verb = args.first().ok_or("missing native command")?;
     let mut position = 1;
@@ -84,6 +86,9 @@ fn options(args: &[String]) -> Result<Options> {
                 "--size" if matches!(verb.as_str(), "server" | "start" | "ssh-entry") => {
                     result.size = parse_size(value)?;
                     validate_size(result.size.0, result.size.1)?;
+                }
+                "--startup-panes" if matches!(verb.as_str(), "server" | "start") => {
+                    result.startup_panes = value.parse()?;
                 }
                 _ => return Err(format!("unknown {verb} option {arg}").into()),
             }
@@ -198,6 +203,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 ui: options.settings.ui,
                 initial_grid: options.settings.grid,
                 initial_tabs: options.settings.tab_count,
+                startup_panes: options.startup_panes,
             })
         }
         "start" => {
@@ -211,6 +217,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 settings: &options.settings,
                 replace_running: options.replace_running,
                 executable: options.server_binary.as_deref(),
+                startup_panes: options.startup_panes,
             })?;
             control(&options.socket, &["list".into()])
         }

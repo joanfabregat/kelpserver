@@ -1,6 +1,6 @@
 # ADR 0002: KelpServer is a generic session server
 
-- Status: Accepted by Joan 2026-11-20 (America/Los_Angeles). Step 1 implemented; steps 2–4 not started.
+- Status: Accepted by Joan 2026-11-20 (America/Los_Angeles). Step 1 implemented; step 2 server support implemented 2026-11-21 (the KelpMux side of step 2 is separate); steps 3–4 not started.
 - Related: [ADR 0001](0001-native-client-protocol-and-device-capabilities.md), KelpMux [ADR 0003 (web client)](https://github.com/joanfabregat/kelpmux/blob/main/docs/adr/0003-web-client-in-kelpmux.md), KelpHub ADR 0007 (multi-tenant, Kubernetes-only; private repository).
 
 ## Context
@@ -57,3 +57,7 @@ The open points were decided by the boundary rule:
 
 - **`server.rs`, `status.rs` and `discovery.rs`.** `discovery.rs` (Claude/Codex agent discovery and polling) produces pane observations shared by every client and stays. `status.rs` splits: host sampling (`Monitor`, `Snapshot`, `Process`, `Disk`) stays and is exposed by `host-status`; its presentation (`View`, `Sort`, column and layout helpers, formatting) moves to KelpMux with the Status dialog in step 2. `server.rs` keeps PTYs, the stream and its leases, spawn/close/restore, discovery, history and activity; composed-frame production, `mouse`, the `Action` handling, the TUI controller and theme fallback, title animation, unused-shell hints and the UI parts of `persist_geometry` leave in step 3, after the TUI no longer needs them.
 - **Closed-session records stay in the server and stay generic.** They are derived from server observations (foreground programs, agent sessions), are useful to KelpMux and KelpHub alike, and are addressed by an opaque `key`; only their presentation (restore-choice labels, copying the resume command) is client UI.
+
+### Step 2 server support, 2026-11-21
+
+The KelpMux stream TUI's parity gaps that need the server are closed, additively and behind new capabilities; the stream stays at version 1 and protocol 58 is unchanged. `--startup-panes none` lets the client that starts the server own the initial layout: the server starts with zero panes (nothing in it needs one) and leaves the composed UI's saved tab layout alone. Welcome now carries the startup policy, the unclean-shutdown recovery signal (cleared by `dismiss_recovery` or the composed popup), the subscription limits (64 panes, up from 10; the 100,000-cell bound stays because of the 16 MiB record limit) and the notification run that notification origins are matched against. `spawn` accepts a validated `shell`. Per-pane session data gains `unused_shell`, the composed UI's hint as an observation, and `spawned_by`, the creating stream connection for the epoch. All of these are session facts or lifecycle signals shared by any client, so none adds client UI state to the server. Styled history and the Codex conversation picker are not part of step 2. Details are in [session-api.md](../session-api.md#step-2-server-support-2026-11-21).

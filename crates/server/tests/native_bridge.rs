@@ -556,6 +556,7 @@ fn bridge_relays_session_api_requests_and_opt_in_events() {
         request: "bridge-1".into(),
         cwd: None,
         argv: vec![],
+        shell: None,
     });
     let mut created = None;
     let mut spawned = None;

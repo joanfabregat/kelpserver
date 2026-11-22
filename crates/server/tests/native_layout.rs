@@ -47,6 +47,7 @@ impl Daemon {
             ui: Default::default(),
             initial_grid: (1, 1),
             initial_tabs: Some(count),
+            startup_panes: Default::default(),
         };
         let handle = thread::spawn(move || serve(config));
         let deadline = Instant::now() + Duration::from_secs(5);

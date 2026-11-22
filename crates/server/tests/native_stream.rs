@@ -36,6 +36,7 @@ impl Daemon {
             ui: Default::default(),
             initial_grid: (2, 1),
             initial_tabs: None,
+            startup_panes: Default::default(),
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {

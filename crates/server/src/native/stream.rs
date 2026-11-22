@@ -1,7 +1,7 @@
 //! Experimental UI-independent pane streams. SSH transports these framed messages unchanged.
 //!
-//! Send `Hello { version: 1 }` first, then `Subscribe` (replacement set, at most ten
-//! unique current panes). Welcome's random server epoch scopes all pane IDs. A new
+//! Send `Hello { version: 1 }` first, then `Subscribe` (replacement set, at most
+//! `MAX_SUBSCRIPTIONS` unique current panes, advertised in Welcome `limits`). Welcome's random server epoch scopes all pane IDs. A new
 //! epoch invalidates every saved baseline/lease, even if numerical IDs repeat.
 //! Every Update includes current bounded metadata, notifications and structured vitals.
 //! A snapshot starts revision 1; patches advance exactly one revision and require
@@ -27,7 +27,9 @@
 //! or by sending a correlated request, so v1 clients that reject unknown
 //! events never receive one. Clients must check the Welcome capabilities
 //! before sending a new request: an older server disconnects on an unknown
-//! request type. Device/MCP capabilities remain deferred.
+//! request type. Step 2 adds `startup-policy`, `recovery-signal`,
+//! `spawn-shell`, `unused-shell`, `stream-limits`, `notification-run` and
+//! `spawned-by` the same way. Device/MCP capabilities remain deferred.
 use super::protocol::{
     Cell, Cursor, InputModes, MouseEvent, Notification, PaneId, PaneInfo, PaneSearchMatch, Screen,
 };
@@ -36,7 +38,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const VERSION: u16 = 1;
-pub const MAX_SUBSCRIPTIONS: usize = 10;
+/// Subscribed panes per connection (advertised in Welcome `limits`). Every
+/// pane of a grid shown on one terminal fits: 64 leaves headroom over 24- to
+/// 36-pane grids. The per-pane cost is one retained screen baseline, which
+/// `MAX_SUBSCRIBED_CELLS` bounds in aggregate.
+pub const MAX_SUBSCRIPTIONS: usize = 64;
 /// Pane geometry is independent of the composed TUI's minimum window size.
 pub fn validate_size(cols: u16, rows: u16) -> Result<()> {
     if !(2..=400).contains(&cols) || !(1..=160).contains(&rows) {
@@ -44,8 +50,61 @@ pub fn validate_size(cols: u16, rows: u16) -> Result<()> {
     }
     Ok(())
 }
-/// Bound both retained screen baselines and aggregate update serialization.
+/// Bound both retained screen baselines and aggregate update serialization
+/// (advertised in Welcome `limits`).
+///
+/// A backpressured update carries every subscribed screen as a snapshot in
+/// one record, and records are capped at 16 MiB. A cell serializes to about
+/// 100 JSON bytes with default colours and up to about 160 with RGB colours
+/// and an underline colour, so 100,000 cells (at most about 15 MiB) is the
+/// largest budget that always fits one record. A retained baseline cell costs
+/// about 100 bytes of memory, so a connection keeps at most about 10 MB. The
+/// budget does not limit grids: the panes displayed on one terminal together
+/// cover at most that terminal, and the largest native pane is 400 × 160 =
+/// 64,000 cells. Hidden panes are unsubscribed (see "Parking").
 pub const MAX_SUBSCRIBED_CELLS: usize = 100_000;
+/// Advertised stream bounds, so clients need not hardcode them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Most panes in one `subscribe`.
+    pub subscriptions: usize,
+    /// Most aggregate screen cells (columns × rows) of the subscribed panes.
+    pub subscribed_cells: usize,
+}
+pub const LIMITS: Limits = Limits {
+    subscriptions: MAX_SUBSCRIPTIONS,
+    subscribed_cells: MAX_SUBSCRIBED_CELLS,
+};
+/// Which panes the server creates when it starts (`--startup-panes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPanes {
+    /// The composed UI's startup tabs: the template, the saved
+    /// `tab-layout.json` or the configured grid of shells.
+    #[default]
+    Layout,
+    /// No pane: a stream client creates its own layout with `spawn`. The
+    /// server's saved tab layout and tab count are left untouched.
+    None,
+}
+impl std::str::FromStr for StartupPanes {
+    type Err = Box<dyn std::error::Error + Send + Sync>;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "layout" => Ok(Self::Layout),
+            "none" => Ok(Self::None),
+            _ => Err("--startup-panes must be layout or none".into()),
+        }
+    }
+}
+impl StartupPanes {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Layout => "layout",
+            Self::None => "none",
+        }
+    }
+}
 pub const CAPABILITIES: &[&str] = &[
     "pane-snapshots",
     "pane-patches",
@@ -65,6 +124,13 @@ pub const CAPABILITIES: &[&str] = &[
     "notification-ack-all",
     "host-status",
     "server-lifecycle",
+    "startup-policy",
+    "recovery-signal",
+    "spawn-shell",
+    "unused-shell",
+    "stream-limits",
+    "notification-run",
+    "spawned-by",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
@@ -143,6 +209,16 @@ pub enum Request {
         cwd: Option<PathBuf>,
         #[serde(default)]
         argv: Vec<String>,
+        /// `spawn-shell`: an absolute path to an executable file to run
+        /// instead of the server's shell. Omitted when absent, so a request
+        /// without it stays valid for servers without `spawn-shell`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<PathBuf>,
+    },
+    /// `recovery-signal`: clear the unclean-shutdown signal for every
+    /// client, including the composed UI's recovery popup.
+    DismissRecovery {
+        request: String,
     },
     /// `pane-lifecycle`: terminate a pane's process group and remove the pane.
     /// Refused while another connection holds the pane's lease.
@@ -208,6 +284,7 @@ impl Request {
             | Self::Restore { request, .. }
             | Self::History { request, .. }
             | Self::Search { request, .. }
+            | Self::DismissRecovery { request }
             | Self::Shutdown { request } => Some(request),
             _ => None,
         }
@@ -231,6 +308,17 @@ pub struct PaneSession {
     pub startup: Option<String>,
     /// The latest OSC title set by the application, unmodified by naming rules.
     pub terminal_title: Option<String>,
+    /// `unused-shell`: the pane's shell has no child process, no pending or
+    /// recent input (two idle observations and a 200 ms cooldown), and no
+    /// other process on its terminal. Sampled every 500 ms while a
+    /// connection has `session_events` enabled; leases do not affect it.
+    #[serde(default)]
+    pub unused_shell: bool,
+    /// `spawned-by`: the Welcome `client` ID of the stream connection whose
+    /// `spawn` or `restore` created the pane, within this epoch. Absent for
+    /// startup panes, the composed UI and administration requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -344,6 +432,21 @@ pub enum Event {
         /// The server's package version (`server-lifecycle`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_version: Option<String>,
+        /// The server's startup policy (`startup-policy`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        startup_panes: Option<StartupPanes>,
+        /// The previous run ended uncleanly and no client has shown or
+        /// dismissed recovery yet (`recovery-signal`). Omitted when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        recovery_pending: bool,
+        /// Subscription bounds (`stream-limits`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<Limits>,
+        /// The current run in notification origins (`notification-run`): a
+        /// notification belongs to a live pane when `origin.run` equals it,
+        /// `origin.pid` equals the pane's `pid` and its `pane` the pane ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_run: Option<String>,
     },
     Update(Update),
     Lease {

@@ -28,7 +28,7 @@ Every record has a four-byte unsigned big-endian payload length followed by UTF-
 {"Stream":{"type":"hello","version":1}}
 ```
 
-The server responds with `Stream` / `welcome`, containing stream version, connection/client ID, a random server epoch, and supported capabilities. Send Hello exactly once before other stream requests. Legacy TUI/management messages are rejected on a negotiated stream connection and by the bridge. Unsupported versions fail clearly. Current capabilities are `pane-snapshots`, `pane-patches`, `pane-leases`, `metadata`, `notifications`, `vitals`, `hyperlinks`, `program-status`, `controller-theme`, `clipboard-write` and `pane-spawn`, plus the [session API](#session-api) capabilities `pane-lifecycle`, `closed-sessions`, `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status` and `server-lifecycle`; do not infer support for undeclared future capabilities. A server with `server-lifecycle` also puts its package version in Welcome `server_version`.
+The server responds with `Stream` / `welcome`, containing stream version, connection/client ID, a random server epoch, and supported capabilities. Send Hello exactly once before other stream requests. Legacy TUI/management messages are rejected on a negotiated stream connection and by the bridge. Unsupported versions fail clearly. Current capabilities are `pane-snapshots`, `pane-patches`, `pane-leases`, `metadata`, `notifications`, `vitals`, `hyperlinks`, `program-status`, `controller-theme`, `clipboard-write` and `pane-spawn`, plus the [session API](#session-api) capabilities `pane-lifecycle`, `closed-sessions`, `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status`, `server-lifecycle`, `startup-policy`, `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`, `notification-run` and `spawned-by`; do not infer support for undeclared future capabilities. A server with `server-lifecycle` also puts its package version in Welcome `server_version`.
 
 Clients recognizing `clipboard-write` may opt in with `{"Stream":{"type":"clipboard","enabled":true}}`. Application OSC 52 writes then produce `clipboard` events containing `pane` and UTF-8 `text` (at most 64 KiB), delivered only to that pane's current lease owner. Observers and clients that have not opted in receive no clipboard data. Writes from panes without a stream owner retain their existing TUI-controller route. Clipboard events are ephemeral: never replay them in snapshots, history or reconnect state. Clipboard reads remain disabled. Browser clients must provide an explicit copy fallback when platform user-activation rules prevent an asynchronous write.
 
@@ -46,7 +46,7 @@ Subscribe replaces the complete subscription set. Updates contain an authoritati
 
 A full pane snapshot establishes revision 1. A patch names the pane, base revision and resulting revision; it applies only to that exact pane baseline in the current server epoch. Geometry changes, explicit `resync` and backpressure can produce replacement snapshots. Snapshots contain cells with colors/attributes/widths, cursor and input modes; they do not contain native headers, tabs or footer cells. Alacritty remains the only emulator answering application terminal queries.
 
-There are at most ten subscribed panes and 100,000 aggregate subscribed screen cells per connection. Oversized subscriptions are rejected. A later size change exceeding an observer's aggregate budget disconnects that observer instead of retaining unbounded data. The server retains one in-flight packet and one replaceable aggregate update. The bridge has separate bounded queues in each direction and yields between decode batches. A permanently slow client can be disconnected and resynchronize on reconnect.
+There are at most 64 subscribed panes and 100,000 aggregate subscribed screen cells per connection (ten panes before `stream-limits`); a server with `stream-limits` advertises both in Welcome `limits`, so clients should read them rather than hardcode them. The cell budget keeps a backpressured update, which carries every subscribed screen as a snapshot, under the 16 MiB record limit (a cell serializes to about 100–160 bytes); it does not limit grids, because the panes displayed on one terminal together cover at most that terminal (the largest native pane is 400 × 160 = 64,000 cells). Oversized subscriptions are rejected. A later size change exceeding an observer's aggregate budget disconnects that observer instead of retaining unbounded data. The server retains one in-flight packet and one replaceable aggregate update. The bridge has separate bounded queues in each direction and yields between decode batches. A permanently slow client can be disconnected and resynchronize on reconnect.
 
 ## Independent ownership and size
 
@@ -87,7 +87,7 @@ The server's `hyperlinks` capability indicates support for an optional `hyperlin
 
 ## Session API
 
-The session API is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the session-level operations a full TUI needs to run as a stream client with local rendering and local UI state. The classification of every TUI capability, and what remains, is in [session-api.md](session-api.md). The composed protocol 58 is unchanged.
+The session API is step 1 of [ADR 0002](adr/0002-generic-session-server.md): the session-level operations a full TUI needs to run as a stream client with local rendering and local UI state. Server support for step 2 (the stream TUI's parity gaps) adds the [step 2 capabilities](#step-2-additions). The classification of every TUI capability, and what remains, is in [session-api.md](session-api.md). The composed protocol 58 is unchanged.
 
 ### Compatibility
 
@@ -102,15 +102,23 @@ The stream stays at version 1; nothing in v1 changed meaning. Every addition is 
 | `notification-ack-all` | `acknowledge_all` | none |
 | `host-status` | `host_status {enabled}` | `Update.host` |
 | `server-lifecycle` | `shutdown` | `server_stopping`, Welcome `server_version` |
+| `startup-policy` | none (server option `--startup-panes`) | Welcome `startup_panes` |
+| `recovery-signal` | `dismiss_recovery` | Welcome `recovery_pending`, `done` |
+| `spawn-shell` | `spawn` field `shell` | none |
+| `unused-shell` | none | `PaneSession.unused_shell` |
+| `stream-limits` | none | Welcome `limits` |
+| `notification-run` | none | Welcome `notification_run` |
+| `spawned-by` | none | `PaneSession.spawned_by` |
 
 Rules that keep older peers working:
 
-- A connection receives an event of a new type only after it opts in (`session_events`, `host_status`) or as the reply to a request it sent. Existing clients that reject unknown event types (KelpClient, KelpHub's bridge) therefore never see one. `Update.sessions` and `Update.host` are omitted unless enabled.
-- New fields on existing messages (`Welcome.server_version`, `Error.request`, `Update.sessions`, `Update.host`) are optional; decoders that ignore unknown fields are unaffected.
+- A connection receives an event of a new type only after it opts in (`session_events`, `host_status`) or as the reply to a request it sent. Existing clients that reject unknown event types (KelpClient, KelpHub's bridge) therefore never see one. `Update.sessions` and `Update.host` are omitted unless enabled. Step 2 adds no event type.
+- New fields on existing messages (`Welcome.server_version`, `Welcome.startup_panes`, `Welcome.recovery_pending`, `Welcome.limits`, `Welcome.notification_run`, `Error.request`, `Update.sessions`, `Update.host`, `PaneSession.unused_shell`, `PaneSession.spawned_by`) are optional; decoders that ignore unknown fields are unaffected. Absent fields are omitted from the wire (`recovery_pending` when false, `spawned_by` when unknown).
+- `spawn` without a shell serializes exactly as before, so it stays valid for a server without `spawn-shell`; with `shell`, such a server rejects the request.
 - A server without a capability disconnects a connection that sends an unknown request type. Check the Welcome capabilities before sending any request listed above.
 - The SSH bridge relays every stream request after Hello, so the session API works through `kelpserver bridge` unchanged.
 
-In the Rust API, `Event::Welcome`, `Event::Error` and `Update` gained fields and `Request`/`Event` gained variants, so exhaustive matches and struct literals in consumers need updating when they move their pin.
+In the Rust API, `Event::Welcome`, `Event::Error` and `Update` gained fields and `Request`/`Event` gained variants, so exhaustive matches and struct literals in consumers need updating when they move their pin. Step 2 adds fields to `Event::Welcome`, `Request::Spawn`, `PaneSession` and `ServerConfig`, and the `Request::DismissRecovery` variant; patterns with `..` are unaffected.
 
 ### Correlation and errors
 
@@ -168,6 +176,32 @@ Events are reliable messages. A replaceable update that was built before an even
 `{"type":"host_status","enabled":true}` adds `host` to that connection's updates (`host-status`): per-CPU usage, memory and swap bytes, load, uptime, task counts, network and disk I/O rates, mounted disks and the process table, sampled on demand about once a second while at least one connection wants it. `ready` is false until the first sample. Views, sorting and formatting are client UI.
 
 `shutdown {request}` replies `done` and stops the server and its panes (`server-lifecycle`). A connection that enabled `session_events` receives `server_stopping {reason: "shutdown"|"last_pane_exited"}` before its socket closes; the server gives queued messages up to 200 ms. There is no upgrade event: a live server is never upgraded in place. A client detects a different server by its epoch and `server_version`, and its features by the capabilities.
+
+### Step 2 additions
+
+Server support for ADR 0002 step 2, so a stream TUI reaches parity with the composed one. All of it is additive under the capabilities in the table above.
+
+```json
+{"Stream":{"type":"welcome","version":1,"client":4,"epoch":"…","capabilities":[…],"server_version":"0.2.0","startup_panes":"none","recovery_pending":true,"limits":{"subscriptions":64,"subscribed_cells":100000},"notification_run":"…"}}
+```
+
+**Startup policy (`startup-policy`).** `kelpserver server` and `kelpserver start` accept `--startup-panes layout|none`; the default, `layout`, keeps the composed UI's startup tabs (template, saved `tab-layout.json` or configured grid, and at least one shell). With `none` the server starts with zero panes and the client that started it creates its layout with `spawn`. The server works without panes: the composed UI renders an empty workspace, and only the last pane's exit (not an empty pane list) stops the server. Under `none` the server never rewrites `tab-layout.json` or the saved tab count in `workspace.json`, so the composed UI's next `layout` start is unchanged. The policy is not persisted; `start` passes it to the server it launches and has no effect on a server that is already running. Welcome `startup_panes` reports the running server's policy. Closing the last pane with `close` still creates a replacement shell first, as in step 1.
+
+**Recovery signal (`recovery-signal`).** Welcome `recovery_pending: true` means the previous server run ended without an orderly shutdown (its run marker was still present) and no client has shown or dismissed recovery yet. The candidates are the closed-session records, including those marked `Previous run`: list them with `closed_sessions`. `{"type":"dismiss_recovery","request":"r7"}` replies `done` and clears the signal for every client; the composed UI's recovery popup also clears it when it opens for the attached controller. The signal never becomes true during a run, so Welcome is its only carrier.
+
+**Spawn with a shell (`spawn-shell`).** `spawn` takes an optional `shell`, an absolute path to an existing executable regular file (the same check `start` applies to the workspace shell). It runs instead of the server's shell, including after the arguments (`exec <shell> -i`), and becomes the pane's `PaneSession.shell`. Another value fails with an error naming the shell. The retry identity is the request, directory, arguments and shell.
+
+```json
+{"Stream":{"type":"spawn","request":"r8","cwd":"/home/me","argv":[],"shell":"/usr/bin/fish"}}
+```
+
+**Unused shell (`unused-shell`).** `PaneSession.unused_shell` is the composed UI's unused-shell hint as an observation: the pane's shell has no child process and no other process on its terminal, has seen no input for 200 ms with no input pending, and two separate idle observations agree. It is sampled every 500 ms (process table) and 100 ms (idle observations) while a composed UI is attached or a stream connection has `session_events` enabled, and otherwise stays false. Unlike the composed hint, a lease does not hide it, because a stream TUI leases the panes it shows; clients combine it with `Update.leases` if they need to.
+
+**Limits (`stream-limits`).** Welcome `limits {subscriptions, subscribed_cells}` advertises the subscription bounds described in [Pane subscriptions and updates](#pane-subscriptions-and-updates): 64 panes and 100,000 cells. Servers without the capability allow ten panes.
+
+**Notification run (`notification-run`).** Notifications carry `origin {run, pid}`. Welcome `notification_run` is the current run, the value the composed UI compares origins with: a notification refers to a live pane when `origin.run` equals it, `origin.pid` equals the pane's `pid` and `pane` equals the pane ID. Older notifications, or those from a previous run, no longer refer to a live pane even if a pane has the same ID. This lets a client jump to a notification's pane and badge panes exactly like the composed UI, without guessing the run from the notification list.
+
+**Spawned by (`spawned-by`).** `PaneSession.spawned_by` is the Welcome `client` ID of the stream connection whose `spawn` or `restore` created the pane, so a client can recognize the panes it created (for example for its layout, or its scratch terminal). Client IDs are per connection: a client that reconnects gets a new ID, so it must remember its previous IDs for the epoch to recognize its earlier panes. It is absent for startup panes and panes created by the composed UI or the `SpawnPane` administration request. It is not persisted: a new epoch starts without it, and a client ID is not an identity across connections.
 
 ### Parking and hidden panes
 

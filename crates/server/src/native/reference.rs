@@ -62,9 +62,9 @@ impl State {
                     || panes.len() != update.panes.len()
                     || panes.contains(&0)
                     || !wanted.is_subset(&panes)
-                    || update.snapshots.len() > 10
-                    || update.patches.len() > 10
-                    || update.leases.len() > 10
+                    || update.snapshots.len() > stream::MAX_SUBSCRIPTIONS
+                    || update.patches.len() > stream::MAX_SUBSCRIPTIONS
+                    || update.leases.len() > update.panes.len()
                     || update.notifications.len() > 256
                 {
                     return Err("invalid native stream metadata bounds".into());
@@ -116,7 +116,7 @@ impl State {
                     || !self.panes.is_empty() && !self.panes.iter().any(|info| info.id == pane)
                     || owner.is_some()
                         && !self.leases.iter().any(|lease| lease.pane == pane)
-                        && self.leases.len() >= 10
+                        && self.leases.len() >= self.panes.len().max(stream::MAX_SUBSCRIPTIONS)
                 {
                     return Err("invalid native lease event".into());
                 }
