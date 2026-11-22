@@ -14,6 +14,7 @@ fn hello() -> Event {
         recovery_pending: false,
         limits: None,
         notification_run: None,
+        upload_limits: None,
     }
 }
 fn snapshot(pane: u64) -> PaneSnapshot {
@@ -104,6 +105,7 @@ fn epoch_handshake_and_missing_baseline_errors_are_transactional() {
                 recovery_pending: false,
                 limits: None,
                 notification_run: None,
+                upload_limits: None,
             })
             .is_err()
     );
@@ -238,4 +240,33 @@ fn standalone_lease_events_have_bounds_and_validate_known_membership_transaction
             .is_err()
     );
     assert_eq!(as_json(&known), before);
+}
+#[test]
+fn upload_replies_are_tolerated_without_changing_state() {
+    let mut s = state();
+    let before = as_json(&s);
+    for event in [
+        Event::UploadStarted {
+            request: "u1".into(),
+            batch: 1,
+            dir: "/tmp/x".into(),
+        },
+        Event::UploadProgress {
+            batch: 1,
+            file_index: 0,
+            received: 10,
+        },
+        Event::UploadDone {
+            request: "u2".into(),
+            batch: 1,
+            paths: vec!["/tmp/x/a".into()],
+        },
+        Event::UploadFailed {
+            batch: 2,
+            message: "failed".into(),
+        },
+    ] {
+        s.apply(event).unwrap();
+    }
+    assert_eq!(as_json(&s), before);
 }

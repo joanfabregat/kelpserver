@@ -53,6 +53,7 @@ impl Daemon {
             cwd: root.clone(),
             cols: 100,
             rows: 30,
+            uploads: Default::default(),
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {

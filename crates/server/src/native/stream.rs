@@ -28,7 +28,8 @@
 //! capabilities before sending a new request: an older server disconnects on
 //! an unknown request type. Step 2 of ADR 0002 added `startup-policy`,
 //! `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`,
-//! `notification-run` and `spawned-by` the same way. Device/MCP capabilities
+//! `notification-run` and `spawned-by` the same way, and decision 151a added
+//! `uploads` (see `super::uploads`). Device/MCP capabilities
 //! remain deferred.
 use super::protocol::{
     Cell, Cursor, InputModes, MouseEvent, Notification, PaneId, PaneInfo, PaneSearchMatch, Screen,
@@ -132,6 +133,7 @@ pub const CAPABILITIES: &[&str] = &[
     "notification-run",
     "spawned-by",
     "diagnostics",
+    "uploads",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
@@ -277,6 +279,33 @@ pub enum Request {
     Diagnostics {
         request: String,
     },
+    /// `uploads`: declare a batch of files. `dest` is an existing absolute
+    /// directory owned by the server's user; the batch gets its own private
+    /// directory inside it (or inside the server's upload directory).
+    UploadBegin {
+        request: String,
+        files: Vec<super::uploads::FileSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest: Option<PathBuf>,
+    },
+    /// `uploads`: the next base64 bytes of a batch. Files are sent in order
+    /// and each file's chunks at strictly sequential offsets.
+    UploadChunk {
+        batch: u64,
+        file_index: usize,
+        offset: u64,
+        data: String,
+    },
+    /// `uploads`: publish a complete batch.
+    UploadFinish {
+        request: String,
+        batch: u64,
+    },
+    /// `uploads`: remove a batch and its files.
+    UploadCancel {
+        request: String,
+        batch: u64,
+    },
 }
 impl Request {
     /// The correlation identifier echoed by this request's reply and errors.
@@ -290,7 +319,10 @@ impl Request {
             | Self::Search { request, .. }
             | Self::DismissRecovery { request }
             | Self::Shutdown { request }
-            | Self::Diagnostics { request } => Some(request),
+            | Self::Diagnostics { request }
+            | Self::UploadBegin { request, .. }
+            | Self::UploadFinish { request, .. }
+            | Self::UploadCancel { request, .. } => Some(request),
             _ => None,
         }
     }
@@ -452,6 +484,9 @@ pub enum Event {
         /// `origin.pid` equals the pane's `pid` and its `pane` the pane ID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_run: Option<String>,
+        /// Upload bounds and the flow-control window (`uploads`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upload_limits: Option<super::uploads::Limits>,
     },
     Update(Update),
     Lease {
@@ -522,6 +557,30 @@ pub enum Event {
         request: String,
         report: super::diagnostics::Report,
     },
+    /// `uploads`: the batch was created in `dir`.
+    UploadStarted {
+        request: String,
+        batch: u64,
+        dir: PathBuf,
+    },
+    /// `uploads`: one chunk was written; `received` bytes of the file so far.
+    /// Every accepted chunk gets exactly one, in order.
+    UploadProgress {
+        batch: u64,
+        file_index: usize,
+        received: u64,
+    },
+    /// `uploads`: the batch's files, in request order, as absolute paths.
+    UploadDone {
+        request: String,
+        batch: u64,
+        paths: Vec<PathBuf>,
+    },
+    /// `uploads`: a chunk failed; the batch and its files were removed.
+    UploadFailed {
+        batch: u64,
+        message: String,
+    },
 }
 
 impl Event {
@@ -535,7 +594,9 @@ impl Event {
             | Self::Restored { request, .. }
             | Self::History { request, .. }
             | Self::Search { request, .. }
-            | Self::Diagnostics { request, .. } => Some(request),
+            | Self::Diagnostics { request, .. }
+            | Self::UploadStarted { request, .. }
+            | Self::UploadDone { request, .. } => Some(request),
             Self::Error { request, .. } => request.as_deref(),
             _ => None,
         }

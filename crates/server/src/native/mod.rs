@@ -22,5 +22,6 @@ pub mod stream;
 pub mod templates;
 pub mod tracking;
 pub mod upgrade;
+pub mod uploads;
 pub mod vitals;
 pub mod web_relay;

@@ -140,6 +140,12 @@ impl State {
             | Event::History { .. }
             | Event::Search { .. }
             | Event::Diagnostics { .. } => return Err("unsolicited session API event".into()),
+            // Upload replies concern files, not the screen state this client
+            // validates; a client sharing the connection may upload.
+            Event::UploadStarted { .. }
+            | Event::UploadProgress { .. }
+            | Event::UploadDone { .. }
+            | Event::UploadFailed { .. } => {}
         }
         Ok(())
     }

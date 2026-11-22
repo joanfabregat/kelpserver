@@ -92,3 +92,20 @@ KelpServer 0.3.0 removes the composed protocol 58 and the server-side UI. Contra
 - **Errors instead of hangs:** an undecodable record, including every composed-protocol message, gets `{"Error":"…"}` naming the removal, then the connection closes.
 - **Versions:** crate `kelpserver` 0.3.0-beta.1 and `kelpclient-protocol` 0.2.0 (without `LOCAL_PROTOCOL_VERSION`); the stream stays at version 1. `server.identity.json` records stream version 1 in `protocol`, where 0.2 servers recorded 58.
 - **Kept for clients, not used by the server:** `templates` (a client startup layout format), the vitals presentation helpers, `history::RestoreChoice` and the `PaneInfo` fields `parked`, `number` and `palette`, which the server now fills with neutral values (never parked, creation-order position, ID-derived palette).
+
+## Uploads (2026-11-21, decision 151a)
+
+File and image uploads dropped onto a terminal in a client are a server capability (`uploads`), because KelpMux and KelpHub both need them and the files must land where the shells run: the user's machine for KelpMux, the workspace pod for KelpHub, which may have no SSH daemon. Clients own the drop UI and paste the resulting shell-quoted paths into the pane. Contract: [native-client-protocol.md](native-client-protocol.md#uploads-uploads).
+
+| Capability | Session or client UI | Addition |
+| --- | --- | --- |
+| Upload files to the server host | Session (files where the shells run) | `upload_begin {request, files, dest?}` → `upload_started {request, batch, dir}`; `upload_chunk {batch, file_index, offset, data}` → `upload_progress {batch, file_index, received}` (window of `max_chunks_in_flight` unacknowledged chunks); `upload_finish` → `upload_done {request, batch, paths}`; `upload_cancel` → `done`; `upload_failed {batch, message}` when a chunk fails. Welcome `upload_limits`. Batches are private per-batch directories scoped to the connection; completed batches are kept for a configurable retention (default 7 days). |
+| Drop target, progress display, pasting the quoted paths | Client UI | None: the client pastes the `upload_done` paths with `paste` or `input`. |
+
+Decisions:
+
+1. **Encoding.** Chunks are base64 strings in the JSON record: the stream has no binary framing, and the byte arrays `input` uses cost up to four bytes per byte. A 256 KiB chunk is about 342 KiB on the wire, well under the 16 MiB record cap, so pane updates are not starved. Measured locally through the Unix socket (release build, 100 MiB file, tmpfs): about 420–540 MB/s; a debug build about 15 MB/s. No binary framing is needed.
+2. **Authorization.** Any stream connection may upload: the same trust as typing into a shell, which any connection may do after claiming a pane.
+3. **Order.** Files are sent in request order and each file at strictly sequential offsets, so the server holds one open file per batch.
+4. **Failure.** Any failing chunk or finish removes the whole batch; there is no resume. A disconnect removes the connection's unfinished batches.
+5. **Retention.** Only batches recorded in the server's `uploads.json` (path, device, inode) are ever deleted, without following symlinks. Unfinished batches of a previous run are removed at startup whatever the retention.

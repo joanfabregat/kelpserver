@@ -36,6 +36,8 @@ pub struct ServerConfig {
     /// The base pane size: panes without a lease have this size.
     pub cols: u16,
     pub rows: u16,
+    /// Upload directory and retention (`uploads`).
+    pub uploads: super::uploads::Settings,
 }
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
@@ -661,6 +663,8 @@ struct Server {
     infos: Vec<PaneInfo>,
     panes: BTreeMap<PaneId, NativePane>,
     clients: BTreeMap<u64, Client>,
+    /// Unfinished upload batches and the upload registry.
+    uploads: super::uploads::Uploads,
     next_pane: u64,
     next_client: u64,
     dirty: bool,
@@ -842,6 +846,7 @@ impl Server {
                 recovery_pending: self.recovery_pending,
                 limits: Some(super::stream::LIMITS),
                 notification_run: Some(self.activity.run().to_owned()),
+                upload_limits: Some(super::uploads::LIMITS),
             };
             let client = self.clients.get_mut(&id).unwrap();
             if client.stream.is_some() {
@@ -1236,6 +1241,58 @@ impl Server {
             Request::Diagnostics { request } => {
                 let report = self.diagnostics();
                 self.reply(id, Event::Diagnostics { request, report })?;
+            }
+            // Uploads change no pane state, so they never trigger an update.
+            // Any stream connection may upload: it is the same trust as
+            // typing into a shell, which any connection may claim.
+            Request::UploadBegin {
+                request,
+                files,
+                dest,
+            } => {
+                let (batch, dir) = self.uploads.begin(id, &files, dest.as_deref())?;
+                return self.reply(
+                    id,
+                    Event::UploadStarted {
+                        request,
+                        batch,
+                        dir,
+                    },
+                );
+            }
+            Request::UploadChunk {
+                batch,
+                file_index,
+                offset,
+                data,
+            } => {
+                let event = match self.uploads.chunk(id, batch, file_index, offset, &data) {
+                    super::uploads::Chunk::Accepted(received) => Event::UploadProgress {
+                        batch,
+                        file_index,
+                        received,
+                    },
+                    super::uploads::Chunk::Failed(message) => {
+                        Event::UploadFailed { batch, message }
+                    }
+                    super::uploads::Chunk::Ignored => return Ok(()),
+                };
+                return self.reply(id, event);
+            }
+            Request::UploadFinish { request, batch } => {
+                let paths = self.uploads.finish(id, batch)?;
+                return self.reply(
+                    id,
+                    Event::UploadDone {
+                        request,
+                        batch,
+                        paths,
+                    },
+                );
+            }
+            Request::UploadCancel { request, batch } => {
+                self.uploads.cancel(id, batch)?;
+                return self.reply(id, Event::Done { request });
             }
             Request::Hello { .. } => unreachable!(),
         }
@@ -2097,6 +2154,7 @@ impl Server {
     }
     fn remove_client(&mut self, id: u64) {
         self.clients.remove(&id);
+        self.uploads.disconnect(id);
         self.recovery_waiters.retain(|(client, _)| *client != id);
         let before = self.leases.len();
         self.leases.retain(|_, lease| lease.owner != id);
@@ -2185,6 +2243,8 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     super::stream::validate_size(config.cols, config.rows)?;
     let (listener, _endpoint) = endpoint(&config)?;
     super::lifecycle::save_pid(&config.state_dir)?;
+    let mut uploads = super::uploads::Uploads::new(&config.state_dir, &config.uploads)?;
+    uploads.sweep(crate::now());
     let mut server = Server {
         history: super::history::History::load(&config.state_dir.join("tab-history.json"))?,
         epoch: fs::read_to_string("/proc/sys/kernel/random/uuid")?
@@ -2210,6 +2270,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         infos: Vec::new(),
         panes: BTreeMap::new(),
         clients: BTreeMap::new(),
+        uploads,
         next_pane: 1,
         spawn_requests: BTreeMap::new(),
         unused_shells: Default::default(),
@@ -2272,6 +2333,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         }
         server.poll_ptys();
         server.poll_recovery();
+        server.uploads.sweep_due();
         let streaming = server
             .clients
             .values()

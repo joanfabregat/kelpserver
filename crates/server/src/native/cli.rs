@@ -16,6 +16,7 @@ struct Options {
     server_binary: Option<PathBuf>,
     command: Vec<String>,
     background: bool,
+    uploads: super::uploads::Settings,
 }
 fn options(args: &[String]) -> Result<Options> {
     let state = super::lifecycle::workspace_path("main")?;
@@ -31,6 +32,7 @@ fn options(args: &[String]) -> Result<Options> {
         server_binary: None,
         command: vec![],
         background: false,
+        uploads: Default::default(),
     };
     let verb = args.first().ok_or("missing native command")?;
     let mut position = 1;
@@ -79,6 +81,18 @@ fn options(args: &[String]) -> Result<Options> {
                 "--size" if matches!(verb.as_str(), "server" | "start") => {
                     result.size = parse_size(value)?;
                     super::stream::validate_size(result.size.0, result.size.1)?;
+                }
+                "--upload-dir" if matches!(verb.as_str(), "server" | "start") => {
+                    result.uploads.dir = Some(PathBuf::from(value));
+                }
+                "--upload-retention-days" if matches!(verb.as_str(), "server" | "start") => {
+                    let days: u32 = value
+                        .parse()
+                        .map_err(|_| "--upload-retention-days needs a number of days")?;
+                    if days > super::uploads::MAX_RETENTION_DAYS {
+                        return Err("--upload-retention-days must be at most 3650".into());
+                    }
+                    result.uploads.retention_days = Some(days);
                 }
                 // Accepted for compatibility: a server always starts without panes.
                 "--startup-panes" if matches!(verb.as_str(), "server" | "start") => {
@@ -130,6 +144,13 @@ fn options(args: &[String]) -> Result<Options> {
             result.shell = shell;
         }
     }
+    // Command-line upload options override the configuration file.
+    if result.uploads.dir.is_none() {
+        result.uploads.dir = settings.upload_dir;
+    }
+    if result.uploads.retention_days.is_none() {
+        result.uploads.retention_days = settings.upload_retention_days;
+    }
     if let Some(cwd) = settings.cwd {
         if !cwd_explicit {
             result.cwd = cwd;
@@ -147,6 +168,9 @@ fn options(args: &[String]) -> Result<Options> {
     result.state = absolute(&result.state)?;
     result.shell = absolute(&result.shell)?;
     result.cwd = absolute(&result.cwd)?;
+    if let Some(dir) = &result.uploads.dir {
+        result.uploads.dir = Some(absolute(dir)?);
+    }
     Ok(result)
 }
 fn parse_size(value: &str) -> Result<(u16, u16)> {
@@ -177,9 +201,19 @@ pub fn run(args: &[String]) -> Result<()> {
                 cwd: options.cwd,
                 cols: options.size.0,
                 rows: options.size.1,
+                uploads: options.uploads,
             })
         }
         "start" => {
+            // The server reads them from workspace.json (`--config`) when it
+            // next starts.
+            if options.uploads != super::uploads::Settings::default() {
+                super::lifecycle::private_state(&options.state)?;
+                super::lifecycle::persist_upload_settings(
+                    &options.state.join("workspace.json"),
+                    &options.uploads,
+                )?;
+            }
             super::lifecycle::start(super::lifecycle::StartRequest {
                 socket: &options.socket,
                 state: &options.state,

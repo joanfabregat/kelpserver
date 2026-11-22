@@ -48,6 +48,10 @@ pub fn private_state(state: &Path) -> Result<()> {
 pub struct Settings {
     pub shell: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
+    /// The upload root (`--upload-dir`).
+    pub upload_dir: Option<PathBuf>,
+    /// Days completed uploads are kept (`--upload-retention-days`, 0 keeps them).
+    pub upload_retention_days: Option<u32>,
 }
 const MAX_SETTINGS: u64 = 64 * 1024;
 fn settings_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -74,6 +78,34 @@ impl Settings {
 /// Record the shell and launch directory in `workspace.json`, keeping every
 /// other key (a client's own settings) unchanged.
 fn persist_settings(path: &Path, shell: &Path, cwd: &Path) -> Result<()> {
+    persist_keys(
+        path,
+        [
+            ("shell", serde_json::to_value(shell)?),
+            ("cwd", serde_json::to_value(cwd)?),
+        ],
+    )
+}
+/// Record the upload settings of `kelpserver start --upload-dir` or
+/// `--upload-retention-days` in `workspace.json`, keeping every other key.
+/// They take effect when the server next starts.
+pub fn persist_upload_settings(path: &Path, uploads: &super::uploads::Settings) -> Result<()> {
+    let mut keys = Vec::new();
+    if let Some(dir) = &uploads.dir {
+        keys.push(("upload_dir", serde_json::to_value(dir)?));
+    }
+    if let Some(days) = uploads.retention_days {
+        keys.push(("upload_retention_days", serde_json::to_value(days)?));
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    persist_keys(path, keys)
+}
+fn persist_keys<'a>(
+    path: &Path,
+    keys: impl IntoIterator<Item = (&'a str, serde_json::Value)>,
+) -> Result<()> {
     let mut object = match settings_bytes(path) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes)? {
             serde_json::Value::Object(object) => object,
@@ -88,8 +120,9 @@ fn persist_settings(path: &Path, shell: &Path, cwd: &Path) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    object.insert("shell".into(), serde_json::to_value(shell)?);
-    object.insert("cwd".into(), serde_json::to_value(cwd)?);
+    for (key, value) in keys {
+        object.insert(key.into(), value);
+    }
     journal::atomic(path, &serde_json::Value::Object(object))
 }
 pub fn workspace_path(name: &str) -> Result<PathBuf> {
