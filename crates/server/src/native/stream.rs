@@ -77,14 +77,22 @@ pub const LIMITS: Limits = Limits {
     subscribed_cells: MAX_SUBSCRIBED_CELLS,
 };
 /// Which panes the server creates when it starts (Welcome `startup_panes`).
-/// Since 0.3 a server always starts without panes; the client that starts it
-/// creates its layout with `spawn`. `--startup-panes none` stays accepted.
+/// Since 0.3 a server always starts without panes and sends `None`; the
+/// client that starts it creates its layout with `spawn`. `--startup-panes
+/// none` stays accepted. The other variants exist only so that a 0.3 client
+/// can decode the Welcome of an older or newer server: they are never sent by
+/// a 0.3 server and `--startup-panes` rejects them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupPanes {
     /// No pane: a stream client creates its own layout with `spawn`.
     #[default]
     None,
+    /// 0.2 servers only: the server created the composed UI's saved layout.
+    Layout,
+    /// Any other value, from a server newer than this client.
+    #[serde(other)]
+    Unknown,
 }
 impl std::str::FromStr for StartupPanes {
     type Err = Box<dyn std::error::Error + Send + Sync>;
@@ -104,6 +112,8 @@ impl StartupPanes {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Layout => "layout",
+            Self::Unknown => "unknown",
         }
     }
 }

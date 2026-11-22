@@ -1567,9 +1567,6 @@ impl Server {
         if last && !replace_last {
             self.stop(super::stream::StopReason::LastPaneExited);
         }
-        for (number, pane) in self.infos.iter_mut().enumerate() {
-            pane.number = number + 1;
-        }
         self.resize();
         Ok(())
     }
@@ -1612,13 +1609,10 @@ impl Server {
         pane.argv = argv;
         pane.spawned_by = spawned_by;
         self.infos.push(PaneInfo {
-            parked: false,
             id,
-            number: self.infos.len() + 1,
             pid: pane.child.id(),
             cwd: folder.to_string_lossy().into_owned(),
             title: "shell".into(),
-            palette: ((id - 1) % 9) as u8,
             status: Status::Unknown,
             session_id: None,
             dead: false,
@@ -1818,7 +1812,6 @@ impl Server {
                                         info.title = if info.kind.is_none() {
                                             super::tracking::shell_tab_name(
                                                 Some(title),
-                                                None,
                                                 info.status == Status::Idle,
                                             )
                                         } else {
@@ -1967,11 +1960,12 @@ impl Server {
         let bridge: Vec<_> = self
             .infos
             .iter()
-            .map(|p| crate::discovery::Pane {
+            .enumerate()
+            .map(|(index, p)| crate::discovery::Pane {
                 id: format!("%{}", p.id),
                 window: "@0".into(),
                 pid: p.pid,
-                index: p.number,
+                index: index + 1,
                 cwd: p.cwd.clone(),
                 dead: p.dead,
                 floating: false,
@@ -2033,7 +2027,7 @@ impl Server {
                 info.session_id = agent.session_id.clone();
                 if let Some(pane) = self.panes.get_mut(&info.id) {
                     let (name, authoritative) =
-                        super::tracking::tab_name(agent, pane.terminal_title.as_deref(), None);
+                        super::tracking::tab_name(agent, pane.terminal_title.as_deref());
                     info.title = name;
                     pane.agent_named = authoritative;
                 }
@@ -2076,7 +2070,6 @@ impl Server {
                     self.panes
                         .get(&info.id)
                         .and_then(|pane| pane.terminal_title.as_deref()),
-                    None,
                     info.status == Status::Idle,
                 );
                 info.observation = crate::model::Observation::checked(

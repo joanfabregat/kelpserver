@@ -1,8 +1,7 @@
 use kelpserver::native::vitals::{
-    self, Sampler, Vitals, bar_glyph,
+    self, Sampler, Vitals,
     cpu::{Sample, State},
     disk::{Space, df_percent},
-    pie_glyph, render_segments,
 };
 use std::{
     fs,
@@ -170,18 +169,9 @@ fn unavailable_metrics_disappear_instead_of_reporting_invented_zero() {
     let time = snapshot.time.as_ref().unwrap();
     assert_eq!(time.as_bytes()[2], b':');
     assert!(!time.split_once(' ').unwrap().1.is_empty());
-    assert!(render_segments(&Vitals::default()).is_empty());
 }
 #[test]
-fn glyphs_color_segments_and_alert_boundary_match_vitals() {
-    assert_eq!(
-        [bar_glyph(0), bar_glyph(19), bar_glyph(50), bar_glyph(94)],
-        ['▁', '▂', '▄', '█']
-    );
-    assert_eq!(
-        [pie_glyph(12), pie_glyph(13), pie_glyph(63), pie_glyph(88)],
-        ['○', '◔', '◕', '●']
-    );
+fn vitals_round_trip_as_structured_data() {
     let data = Vitals {
         cpu: Some(26),
         memory: Some(7),
@@ -190,19 +180,6 @@ fn glyphs_color_segments_and_alert_boundary_match_vitals() {
         date: Some("2026-10-05".into()),
         time: Some("21:01".into()),
     };
-    assert_eq!(
-        render_segments(&data),
-        vec![
-            ("cpu ▂ 26%".into(), 114),
-            ("mem ▁ 7%".into(), 141),
-            ("swap ▁ 0%".into(), 73),
-            ("disk".into(), 222),
-            ("● 89%".into(), 222),
-            ("● 90%".into(), 196),
-            ("2026-10-05".into(), 39),
-            ("21:01".into(), 250)
-        ]
-    );
     assert_eq!(
         serde_json::from_str::<Vitals>(&serde_json::to_string(&data).unwrap()).unwrap(),
         data

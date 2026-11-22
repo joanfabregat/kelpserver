@@ -1,19 +1,19 @@
-//! Version-aware attachment. A live workspace is never restarted to upgrade it.
+//! Server identity for upgrades. A live workspace is never restarted to
+//! upgrade it; clients authenticate the running server with `identify` and
+//! choose a compatible client themselves.
 use crate::{Result, journal};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Read,
     os::{
         fd::AsRawFd,
         unix::{
             fs::{MetadataExt, OpenOptionsExt},
             net::UnixStream,
-            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// The local protocol number recorded by servers of the composed protocol
@@ -145,123 +145,4 @@ pub fn identify(socket: &UnixStream, state: &Path) -> Result<Identity> {
         return Err("workspace server identity is stale or does not match its live socket; no processes were changed".into());
     }
     Ok(saved)
-}
-
-/// Resolve only the exact running executable; a directory name never proves a version.
-/// The retained file descriptor pins the inode across renames and replacement.
-pub fn matching_binary(
-    identity: &Identity,
-    current: &Path,
-    versions: &Path,
-) -> Result<Option<File>> {
-    let current_meta = fs::metadata(current)?;
-    if current_meta.dev() == identity.device && current_meta.ino() == identity.inode {
-        return Ok(None);
-    }
-    if !identity.executable.starts_with(versions)
-        || identity
-            .executable
-            .file_name()
-            .is_none_or(|name| name != "kelpmux")
-    {
-        return Err(format!("workspace runs Kelpmux {} ({}); its matching client is outside the trusted versions directory {}; existing sessions are unchanged", identity.version, identity.protocol_label(), versions.display()).into());
-    }
-    for path in identity.executable.ancestors() {
-        let meta = fs::symlink_metadata(path)?;
-        // A root-owned sticky ancestor cannot replace another user's private
-        // child directory. This permits safe test/temp installations as well.
-        let protected_sticky = meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o1000 != 0;
-        if meta.file_type().is_symlink()
-            || (meta.mode() & 0o022 != 0 && !protected_sticky)
-            || (meta.uid() != unsafe { libc::geteuid() } && meta.uid() != 0)
-        {
-            return Err(
-                "matching client path contains a symlink, foreign owner or writable directory"
-                    .into(),
-            );
-        }
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&identity.executable)
-        .map_err(|error| format!("matching installed client is unavailable ({error}); existing sessions are unchanged"))?;
-    let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o022 != 0
-        || meta.mode() & 0o111 == 0
-        || meta.dev() != identity.device
-        || meta.ino() != identity.inode
-    {
-        return Err("matching installed client is missing, replaced or unsafe; existing sessions are unchanged".into());
-    }
-    Ok(Some(file))
-}
-
-/// Called before terminal raw mode. The descriptor and process birth prevent a
-/// swapped installation or reused PID from selecting another executable.
-pub fn attach_matching(socket: &Path, state: &Path, takeover: bool) -> Result<UnixStream> {
-    let stream = super::connection::connect(socket)?;
-    let identity = identify(&stream, state)?;
-    // A split server executable is not a retained TUI client. Authenticate its
-    // identity and require a compatible wire version before using this client.
-    if identity
-        .executable
-        .file_name()
-        .is_some_and(|name| name == "kelpserver")
-    {
-        if !identity.speaks_stream() {
-            return Err(format!(
-                "KelpServer {} ({}) is incompatible with this client; install a matching client; sessions are unchanged",
-                identity.version,
-                identity.protocol_label()
-            )
-            .into());
-        }
-        return Ok(stream);
-    }
-    let current = std::env::current_exe()?;
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
-    let installation = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".local/share"))
-        .join("kelpmux");
-    let builds = installation.join("builds");
-    let versions = if identity.executable.starts_with(&builds) {
-        builds
-    } else {
-        installation.join("versions")
-    };
-    if let Some(binary) = matching_binary(&identity, &current, &versions)? {
-        let latest = process(identity.pid)?;
-        if latest.birth != identity.birth
-            || latest.device != identity.device
-            || latest.inode != identity.inode
-        {
-            return Err(
-                "workspace server changed while selecting its matching client; retry".into(),
-            );
-        }
-        eprintln!(
-            "Kelpmux workspace: using retained client {} ({}); server remains running",
-            identity.version,
-            identity.protocol_label()
-        );
-        // proc/self/fd opens the pinned inode, even if its installation path is replaced.
-        // A real ELF executable does not need its fd after exec (CLOEXEC is preserved).
-        let mut command = Command::new(format!("/proc/self/fd/{}", binary.as_raw_fd()));
-        command
-            .arg("attach")
-            .arg("--socket")
-            .arg(socket)
-            .arg("--state-dir")
-            .arg(state);
-        if takeover {
-            command.arg("--takeover");
-        }
-        return Err(command.exec().into());
-    }
-    Ok(stream)
 }

@@ -106,14 +106,10 @@ pub struct Screen {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneInfo {
-    #[serde(default)]
-    pub parked: bool,
     pub id: PaneId,
-    pub number: usize,
     pub pid: u32,
     pub cwd: String,
     pub title: String,
-    pub palette: u8,
     pub status: Status,
     #[serde(default)]
     pub observation: crate::model::Observation,

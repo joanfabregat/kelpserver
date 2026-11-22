@@ -5,7 +5,7 @@ use super::{
 };
 use crate::Result;
 use std::path::{Path, PathBuf};
-pub const HELP: &str = "KelpServer: server | start | status | stop | ctl list|diagnostics|shutdown | recover | diagnostics | bridge | stream-inspect | web-relay --config PATH. Servers start without panes; clients create them with the stream protocol. Use KelpMux for attach, web-bridge and the browser client relay.";
+pub const HELP: &str = "KelpServer: server | start | status | stop | ctl list|diagnostics|shutdown | recover | diagnostics | bridge | stream-inspect. Servers start without panes; clients create them with the stream protocol. Use KelpMux for attach, web-bridge and web-relay.";
 struct Options {
     socket: PathBuf,
     state: PathBuf,
@@ -181,12 +181,6 @@ pub fn run(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{HELP}");
         return Ok(());
-    }
-    if args.first().is_some_and(|arg| arg == "web-relay") {
-        if args.len() != 3 || args[1] != "--config" {
-            return Err("usage: kelpserver web-relay --config PATH".into());
-        }
-        return super::web_relay::run(std::path::Path::new(&args[2]));
     }
     let options = options(args)?;
     match args[0].as_str() {

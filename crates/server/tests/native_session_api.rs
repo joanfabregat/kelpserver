@@ -895,6 +895,34 @@ fn startup_policy_parses_only_none() {
     assert_eq!(StartupPanes::default(), StartupPanes::None);
 }
 
+/// A running 0.2 server started with `--startup-panes layout` still says so
+/// in Welcome; a 0.3 client must decode that Welcome (and an unknown future
+/// policy) instead of failing to attach, list or stop the workspace.
+#[test]
+fn welcome_from_older_or_newer_servers_decodes_any_startup_policy() {
+    for (value, expected) in [
+        ("none", StartupPanes::None),
+        ("layout", StartupPanes::Layout),
+        ("from-template", StartupPanes::Unknown),
+    ] {
+        let json = format!(
+            r#"{{"Stream":{{"type":"welcome","version":1,"client":4,"epoch":"e","capabilities":["pane-lifecycle","startup-policy"],"server_version":"0.2.0","startup_panes":"{value}"}}}}"#
+        );
+        let ServerMessage::Stream(Event::Welcome { startup_panes, .. }) =
+            serde_json::from_str::<ServerMessage>(&json).unwrap()
+        else {
+            panic!("not a welcome: {json}");
+        };
+        assert_eq!(startup_panes, Some(expected), "{value}");
+    }
+    // A 0.3 server keeps sending only "none".
+    assert_eq!(
+        serde_json::to_value(StartupPanes::None).unwrap(),
+        serde_json::json!("none")
+    );
+    assert!("layout".parse::<StartupPanes>().is_err());
+}
+
 /// The server starts with no pane and stays usable; a client creates its
 /// layout with `spawn`. Files a client keeps in the state directory, such as
 /// a saved layout or its own `workspace.json` keys, are left alone.

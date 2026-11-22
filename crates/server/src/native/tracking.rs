@@ -9,14 +9,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
-/// Idle shells use a neutral label; aliases and running application titles win.
-pub fn shell_tab_name(terminal: Option<&str>, alias: Option<&str>, idle: bool) -> String {
-    alias
-        .or_else(|| {
-            terminal.filter(|title| {
-                !idle && !title.trim().is_empty() && !title.eq_ignore_ascii_case("shell")
-            })
-        })
+/// Idle shells use a neutral title; running application titles win.
+pub fn shell_tab_name(terminal: Option<&str>, idle: bool) -> String {
+    terminal
+        .filter(|title| !idle && !title.trim().is_empty() && !title.eq_ignore_ascii_case("shell"))
         .unwrap_or("shell")
         .chars()
         .take(1024)
@@ -67,11 +63,8 @@ pub fn track_command(
 }
 
 /// A directory is useful context but is not evidence of a conversation's name.
-/// The boolean means metadata/override owns the title; otherwise OSC may update it.
-pub fn tab_name(agent: &Agent, terminal: Option<&str>, alias: Option<&str>) -> (String, bool) {
-    if let Some(alias) = alias {
-        return (alias.chars().take(1024).collect(), true);
-    }
+/// The boolean means agent metadata owns the title; otherwise OSC may update it.
+pub fn tab_name(agent: &Agent, terminal: Option<&str>) -> (String, bool) {
     let folder = Path::new(&agent.cwd)
         .file_name()
         .unwrap_or_default()
@@ -106,7 +99,7 @@ pub fn tab_name(agent: &Agent, terminal: Option<&str>, alias: Option<&str>) -> (
 
 /// Applications may decorate OSC titles with a spinner independently of agent
 /// metadata. Strip its leading spinner and a matching folder suffix, including
-/// Linux's deleted-cwd marker. Never rewrite explicit names or aliases.
+/// Linux's deleted-cwd marker. Never rewrite explicit agent names.
 pub fn agent_terminal_title<'a>(title: &'a str, cwd: &str) -> &'a str {
     let title = title.trim();
     let mut chars = title.chars();

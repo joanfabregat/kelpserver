@@ -14,4 +14,4 @@ Security reports about the default branch are welcome. This repository has no pu
 
 KelpServer runs every terminal with the authority of the Linux user who owns it. Its local socket and state are private to that user, and peer credentials are checked, but this is not isolation against hostile processes running as the same user. A terminal client can exercise that user's authority; SSH authentication does not make executing untrusted terminal commands safe.
 
-The generic web relay serves caller-supplied static assets and forwards WebSocket bytes to one configured SSH destination after checking its host key. It never terminates SSH, holds no private key and has no path to a workspace socket. The origin that serves browser code remains trusted frontend delivery code. Keep the relay, user-owned services and credentials separated.
+KelpServer contains no browser relay or static asset server; the browser relay belongs to KelpMux (`kelpmux web-relay`) and is covered by its security policy. A browser reaches a workspace only through an SSH-authenticated bridge command (`kelpserver bridge` or a client's own bridge), with the authority of that Linux user.

@@ -57,15 +57,11 @@ fn terminal_title_matches_deleted_cwd_without_truncating_conversation_names() {
     entry.cwd = "/repos/vpn-config (deleted)".into();
     entry.name = "vpn-config (deleted)".into();
     assert_eq!(
-        tab_name(&entry, Some("VPN new device | vpn-config"), None).0,
+        tab_name(&entry, Some("VPN new device | vpn-config")).0,
         "VPN new device"
     );
     entry.name = "Explicit | vpn-config".into();
-    assert_eq!(tab_name(&entry, None, None).0, "Explicit | vpn-config");
-    assert_eq!(
-        tab_name(&entry, None, Some("Alias | vpn-config")).0,
-        "Alias | vpn-config"
-    );
+    assert_eq!(tab_name(&entry, None).0, "Explicit | vpn-config");
 }
 struct Temp(PathBuf);
 impl Temp {
@@ -380,21 +376,14 @@ fn native_hook_command_inherits_custom_state_and_explicit_flag_wins() {
 }
 
 #[test]
-fn shell_names_hide_prompt_identity_but_preserve_application_titles_and_aliases() {
+fn shell_names_hide_prompt_identity_but_preserve_application_titles() {
     use kelpserver::native::tracking::shell_tab_name;
-    assert_eq!(shell_tab_name(None, None, true), "shell");
-    assert_eq!(
-        shell_tab_name(Some("joan@jbox: ~/scratch"), None, true),
-        "shell"
-    );
-    assert_eq!(shell_tab_name(Some("htop"), None, false), "htop");
-    assert_eq!(shell_tab_name(Some(""), None, false), "shell");
+    assert_eq!(shell_tab_name(None, true), "shell");
+    assert_eq!(shell_tab_name(Some("joan@jbox: ~/scratch"), true), "shell");
+    assert_eq!(shell_tab_name(Some("htop"), false), "htop");
+    assert_eq!(shell_tab_name(Some(""), false), "shell");
     for idle in [true, false] {
-        assert_eq!(shell_tab_name(Some("shell"), None, idle), "shell");
-        assert_eq!(
-            shell_tab_name(Some("joan@jbox"), Some("Tools"), idle),
-            "Tools"
-        );
+        assert_eq!(shell_tab_name(Some("shell"), idle), "shell");
     }
 }
 
@@ -406,28 +395,24 @@ fn tab_names_never_use_directory_as_conversation_identity_and_preserve_osc_fallb
     agent.name = "scratch".into();
     agent.session_id = None;
     assert_eq!(
-        tab_name(&agent, None, None),
+        tab_name(&agent, None),
         ("codex · session unknown".into(), false)
     );
     assert_eq!(
-        tab_name(&agent, Some("scratch"), None).0,
+        tab_name(&agent, Some("scratch")).0,
         "codex · session unknown"
     );
     assert_eq!(
-        tab_name(&agent, Some("Fix authentication"), None),
+        tab_name(&agent, Some("Fix authentication")),
         ("Fix authentication".into(), false)
     );
     assert_eq!(
-        tab_name(&agent, Some("⠋ Fix authentication | scratch"), None).0,
+        tab_name(&agent, Some("⠋ Fix authentication | scratch")).0,
         "Fix authentication"
     );
     assert_eq!(
-        tab_name(&agent, Some("Fix authentication | other"), None).0,
+        tab_name(&agent, Some("Fix authentication | other")).0,
         "Fix authentication | other"
-    );
-    assert_eq!(
-        tab_name(&agent, None, Some("Name | scratch")).0,
-        "Name | scratch"
     );
     for title in [
         "⠋ Fix authentication",
@@ -435,25 +420,20 @@ fn tab_names_never_use_directory_as_conversation_identity_and_preserve_osc_fallb
         "⠇ Fix authentication",
     ] {
         assert_eq!(
-            tab_name(&agent, Some(title), None),
+            tab_name(&agent, Some(title)),
             ("Fix authentication".into(), false)
         );
     }
     assert_eq!(
-        tab_name(&agent, Some("⠋ scratch"), None).0,
+        tab_name(&agent, Some("⠋ scratch")).0,
         "codex · session unknown"
     );
-    assert_eq!(tab_name(&agent, Some("⠋real title"), None).0, "⠋real title");
-    assert_eq!(tab_name(&agent, None, Some("⠋ My title")).0, "⠋ My title");
+    assert_eq!(tab_name(&agent, Some("⠋real title")).0, "⠋real title");
     agent.name = "Review conversation".into();
     agent.session_id = Some("verified-session".into());
     assert_eq!(
-        tab_name(&agent, Some("terminal title"), None),
+        tab_name(&agent, Some("terminal title")),
         ("Review conversation".into(), true)
-    );
-    assert_eq!(
-        tab_name(&agent, Some("terminal title"), Some("Backend")),
-        ("Backend".into(), true)
     );
 }
 #[test]

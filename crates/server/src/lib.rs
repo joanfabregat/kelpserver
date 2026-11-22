@@ -1,4 +1,4 @@
-//! Persistent native terminal workspaces and the optional generic SSH relay.
+//! Persistent native terminal workspaces: the session server, its SSH bridge and agent discovery.
 pub mod discovery;
 pub mod journal;
 pub mod model;
@@ -14,19 +14,9 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-/// Escape shell arguments for optional tmux command bindings.
+/// Quote one shell argument (resume and rerun commands of closed sessions).
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// Keep tmux format expansion and control characters out of user-facing labels.
-pub fn label(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect::<String>()
-        .replace('#', "##")
 }
 
 pub fn session_id(value: &str) -> bool {

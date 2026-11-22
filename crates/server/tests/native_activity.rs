@@ -51,7 +51,6 @@ fn pending_background_work_has_a_static_indicator_and_no_completion_alert() {
         .observe(std::slice::from_ref(&agent), time + 1)
         .unwrap();
     assert!(activity.all().is_empty());
-    assert_eq!(agent.status.text(), "WAITING IN BACKGROUND");
 }
 #[test]
 fn notification_baselines_support_more_than_sixty_four_tabs() {

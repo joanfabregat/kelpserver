@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-pub const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -33,30 +31,6 @@ pub enum Status {
 }
 
 impl Status {
-    pub fn text(self) -> &'static str {
-        match self {
-            Self::Working => "WORKING",
-            Self::WaitingBackground => "WAITING IN BACKGROUND",
-            Self::InputNeeded => "INPUT NEEDED",
-            Self::TurnFinished => "TURN FINISHED",
-            Self::Idle => "IDLE",
-            Self::Failed => "FAILED",
-            Self::Exited => "EXITED",
-            Self::Unknown => "UNKNOWN",
-        }
-    }
-    pub fn marker(self) -> &'static str {
-        match self {
-            Self::Working => WORKING_FRAMES[0],
-            Self::WaitingBackground => "◌",
-            Self::InputNeeded => "!",
-            Self::TurnFinished => "✓",
-            Self::Idle => "○",
-            Self::Failed => "×",
-            Self::Exited => "■",
-            Self::Unknown => "?",
-        }
-    }
     pub fn from_live(value: &str) -> Self {
         match value {
             "working" | "running" | "busy" | "active" => Self::Working,
@@ -83,19 +57,6 @@ pub enum StatusSource {
     AppServer,
     Transcript,
     Terminal,
-}
-impl StatusSource {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Unknown => "evidence unknown",
-            Self::Process => "process observation",
-            Self::Hook => "lifecycle hook",
-            Self::LiveRecord => "live record",
-            Self::AppServer => "agent server",
-            Self::Transcript => "transcript observation",
-            Self::Terminal => "terminal program status",
-        }
-    }
 }
 /// A fresh check of historical evidence does not invent a fresh lifecycle event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

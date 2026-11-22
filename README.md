@@ -1,6 +1,6 @@
 # KelpServer
 
-KelpServer is the persistent, user-owned terminal server of the Kelp project. It owns PTYs, process lifecycle, authoritative terminal emulation (Alacritty's engine), scrollback, search, per-pane leases and sizes, closed-session records, recovery metadata and agent activity discovery. Clients own all presentation and UI state. Detaching or losing a client leaves shells and agents running. It also contains a generic, fixed-destination SSH byte relay for browser clients. Recovery metadata cannot preserve live processes across a server crash or reboot.
+KelpServer is the persistent, user-owned terminal server of the Kelp project. It owns PTYs, process lifecycle, authoritative terminal emulation (Alacritty's engine), scrollback, search, per-pane leases and sizes, closed-session records, recovery metadata and agent activity discovery. Clients own all presentation and UI state. Detaching or losing a client leaves shells and agents running. Recovery metadata cannot preserve live processes across a server crash or reboot.
 
 This repository was extracted from [KelpMux](https://github.com/joanfabregat/kelpmux) at commit `eb31da5` so that every client depends on one versioned server contract. The history before the extraction stays in KelpMux.
 
@@ -8,7 +8,7 @@ This repository was extracted from [KelpMux](https://github.com/joanfabregat/kel
 
 | Package | Location | Responsibility |
 | --- | --- | --- |
-| `kelpserver` | [crates/server](crates/server) | Library and `kelpserver` executable: daemon, PTYs, terminal state, the stream protocol and its session API, SSH bridge, generic web relay |
+| `kelpserver` | [crates/server](crates/server) | Library and `kelpserver` executable: daemon, PTYs, terminal state, the stream protocol and its session API, SSH bridge |
 | `kelpclient-protocol` | [crates/protocol](crates/protocol) | Portable wire types, the stream version constant and cell validation, with no server, client-state or WASM dependency |
 
 The package names are historical and kept so that existing consumers need no source changes.
@@ -18,7 +18,7 @@ The package names are historical and kept so that existing consumers need no sou
 KelpServer has no dependency on any client. Its clients are:
 
 - **KelpMux TUI** (the `kelpmux` executable): a pane-stream client that renders locally and keeps its own UI state, and launches or reuses the standalone `kelpserver` daemon. Since 0.3 ([ADR 0002](crates/server/docs/adr/0002-generic-session-server.md) step 3) the server has no composed-screen protocol or UI code.
-- **KelpMux web client** (`kelpmux web-relay` / `kelpmux web-bridge`) and the **KelpClient** Rust/WASM core: use the independent pane stream and the generic relay in this repository; browser assets are supplied by the consumer.
+- **KelpMux web client** (`kelpmux web-relay` / `kelpmux web-bridge`) and the **KelpClient** Rust/WASM core: use the independent pane stream, reached over SSH through a bridge command. KelpMux owns the browser relay, its assets and every presentation helper (tab numbers, colours, status glyphs and labels, vitals formatting, restore-choice labels); since 0.3.0-beta.2 they are no longer part of this repository.
 - **KelpHub**: uses the library and the pane stream behind its own authenticated management adapter. Project, Git and management features stay in KelpHub (file uploads to the host where the shells run are a generic stream capability, `uploads`); KelpServer is not a project manager, credential broker or container orchestrator.
 
 The contract consists of:
@@ -60,7 +60,6 @@ kelpserver start --workspace trial
 kelpserver status --workspace trial          # server and stream versions, then the pane list
 kelpserver diagnostics --workspace trial     # content-free counters
 kelpserver stream-inspect --workspace trial
-kelpserver web-relay --config /path/to/web.json  # relay only: embedding clients supply UI assets via web_relay::run_with_assets
 kelpserver stop --workspace trial
 ```
 
