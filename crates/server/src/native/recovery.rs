@@ -1,15 +1,19 @@
 //! Bounded metadata-only recovery across private named workspace directories.
-use super::{
-    protocol::RecoveryItem,
-    tracking::{self, RecoveryEntry},
-};
+use super::tracking::{self, RecoveryEntry};
 use crate::{Result, journal::RETENTION};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
+/// An agent record of a workspace, for recovery after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryItem {
+    pub workspace: String,
+    pub entry: RecoveryEntry,
+}
 const MAX_WORKSPACES: usize = 64;
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PER_WORKSPACE: usize = 256;

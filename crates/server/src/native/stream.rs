@@ -1,4 +1,5 @@
-//! Experimental UI-independent pane streams. SSH transports these framed messages unchanged.
+//! UI-independent pane streams, the only protocol of the local socket. SSH
+//! transports these framed messages unchanged.
 //!
 //! Send `Hello { version: 1 }` first, then `Subscribe` (replacement set, at most
 //! `MAX_SUBSCRIPTIONS` unique current panes, advertised in Welcome `limits`). Welcome's random server epoch scopes all pane IDs. A new
@@ -9,10 +10,8 @@
 //! produce replacement snapshots. Clients must never apply a patch to another epoch.
 //!
 //! Claim/Resize/Input/Paste/Mouse address one pane. Claim is exclusive, explicit
-//! takeover may replace an owner, and release/disconnect restores the current base
-//! workspace geometry. Leases have connection lifetime (no time-based expiry).
-//! The ordinary TUI retains its independent workspace controller. Actual controller
-//! input/focus reclaims a pane; passive resize and focus-out never steal a lease.
+//! takeover may replace an owner, and release/disconnect restores the server's
+//! base pane size (`--size`). Leases have connection lifetime (no time-based expiry).
 //!
 //! At most 100,000 cells are subscribed per connection. A later resize exceeding
 //! that aggregate budget disconnects that subscriber rather than accumulating state.
@@ -21,15 +20,16 @@
 //! retained records, not an exactly-once event log; acknowledgement is explicit.
 //!
 //! The session API (capabilities `pane-lifecycle`, `closed-sessions`,
-//! `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status` and
-//! `server-lifecycle`) is additive. Its events are sent only to a connection
-//! that asked for them, either by opting in (`session_events`, `host_status`)
-//! or by sending a correlated request, so v1 clients that reject unknown
-//! events never receive one. Clients must check the Welcome capabilities
-//! before sending a new request: an older server disconnects on an unknown
-//! request type. Step 2 adds `startup-policy`, `recovery-signal`,
-//! `spawn-shell`, `unused-shell`, `stream-limits`, `notification-run` and
-//! `spawned-by` the same way. Device/MCP capabilities remain deferred.
+//! `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status`,
+//! `server-lifecycle` and `diagnostics`) is additive. Its events are sent only
+//! to a connection that asked for them, either by opting in (`session_events`,
+//! `host_status`) or by sending a correlated request, so v1 clients that
+//! reject unknown events never receive one. Clients must check the Welcome
+//! capabilities before sending a new request: an older server disconnects on
+//! an unknown request type. Step 2 of ADR 0002 added `startup-policy`,
+//! `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`,
+//! `notification-run` and `spawned-by` the same way. Device/MCP capabilities
+//! remain deferred.
 use super::protocol::{
     Cell, Cursor, InputModes, MouseEvent, Notification, PaneId, PaneInfo, PaneSearchMatch, Screen,
 };
@@ -43,7 +43,7 @@ pub const VERSION: u16 = 1;
 /// 36-pane grids. The per-pane cost is one retained screen baseline, which
 /// `MAX_SUBSCRIBED_CELLS` bounds in aggregate.
 pub const MAX_SUBSCRIPTIONS: usize = 64;
-/// Pane geometry is independent of the composed TUI's minimum window size.
+/// Pane geometry bounds for stream leases and the server base size (`--size`).
 pub fn validate_size(cols: u16, rows: u16) -> Result<()> {
     if !(2..=400).contains(&cols) || !(1..=160).contains(&rows) {
         return Err("pane size must be 2–400 columns and 1–160 rows".into());
@@ -75,32 +75,33 @@ pub const LIMITS: Limits = Limits {
     subscriptions: MAX_SUBSCRIPTIONS,
     subscribed_cells: MAX_SUBSCRIBED_CELLS,
 };
-/// Which panes the server creates when it starts (`--startup-panes`).
+/// Which panes the server creates when it starts (Welcome `startup_panes`).
+/// Since 0.3 a server always starts without panes; the client that starts it
+/// creates its layout with `spawn`. `--startup-panes none` stays accepted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupPanes {
-    /// The composed UI's startup tabs: the template, the saved
-    /// `tab-layout.json` or the configured grid of shells.
+    /// No pane: a stream client creates its own layout with `spawn`.
     #[default]
-    Layout,
-    /// No pane: a stream client creates its own layout with `spawn`. The
-    /// server's saved tab layout and tab count are left untouched.
     None,
 }
 impl std::str::FromStr for StartupPanes {
     type Err = Box<dyn std::error::Error + Send + Sync>;
     fn from_str(value: &str) -> Result<Self> {
         match value {
-            "layout" => Ok(Self::Layout),
             "none" => Ok(Self::None),
-            _ => Err("--startup-panes must be layout or none".into()),
+            "layout" => Err(
+                "--startup-panes layout was removed in KelpServer 0.3: the server \
+                 starts without panes and clients create them with spawn"
+                    .into(),
+            ),
+            _ => Err("--startup-panes must be none".into()),
         }
     }
 }
 impl StartupPanes {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Layout => "layout",
             Self::None => "none",
         }
     }
@@ -116,7 +117,6 @@ pub const CAPABILITIES: &[&str] = &[
     "program-status",
     "controller-theme",
     "clipboard-write",
-    "pane-spawn",
     "pane-lifecycle",
     "closed-sessions",
     "pane-history",
@@ -131,6 +131,7 @@ pub const CAPABILITIES: &[&str] = &[
     "stream-limits",
     "notification-run",
     "spawned-by",
+    "diagnostics",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
@@ -215,8 +216,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell: Option<PathBuf>,
     },
-    /// `recovery-signal`: clear the unclean-shutdown signal for every
-    /// client, including the composed UI's recovery popup.
+    /// `recovery-signal`: clear the unclean-shutdown signal for every client.
     DismissRecovery {
         request: String,
     },
@@ -273,6 +273,10 @@ pub enum Request {
     Shutdown {
         request: String,
     },
+    /// `diagnostics`: bounded server metrics, without terminal contents.
+    Diagnostics {
+        request: String,
+    },
 }
 impl Request {
     /// The correlation identifier echoed by this request's reply and errors.
@@ -285,7 +289,8 @@ impl Request {
             | Self::History { request, .. }
             | Self::Search { request, .. }
             | Self::DismissRecovery { request }
-            | Self::Shutdown { request } => Some(request),
+            | Self::Shutdown { request }
+            | Self::Diagnostics { request } => Some(request),
             _ => None,
         }
     }
@@ -316,7 +321,7 @@ pub struct PaneSession {
     pub unused_shell: bool,
     /// `spawned-by`: the Welcome `client` ID of the stream connection whose
     /// `spawn` or `restore` created the pane, within this epoch. Absent for
-    /// startup panes, the composed UI and administration requests.
+    /// replacement shells the server creates itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<u64>,
 }
@@ -381,7 +386,7 @@ pub fn validate(snapshot: &PaneSnapshot) -> Result<()> {
             cursor.position.x >= screen.cols || cursor.position.y >= screen.rows
         })
         || screen.cells.iter().enumerate().any(|(index, cell)| {
-            !super::delta::cell_valid(cell)
+            !kelpclient_protocol::cell_valid(cell)
                 || cell.width == 2
                     && index % usize::from(screen.cols) + 1 == usize::from(screen.cols)
         })
@@ -513,6 +518,28 @@ pub enum Event {
         results: Vec<PaneSearchResult>,
         truncated: bool,
     },
+    Diagnostics {
+        request: String,
+        report: super::diagnostics::Report,
+    },
+}
+
+impl Event {
+    /// The correlation identifier of a reply, or of an error of a correlated
+    /// request. Unsolicited events have none.
+    pub fn correlation(&self) -> Option<&str> {
+        match self {
+            Self::Spawned { request, .. }
+            | Self::Done { request }
+            | Self::ClosedSessions { request, .. }
+            | Self::Restored { request, .. }
+            | Self::History { request, .. }
+            | Self::Search { request, .. }
+            | Self::Diagnostics { request, .. } => Some(request),
+            Self::Error { request, .. } => request.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Apply only to the exact baseline. A full snapshot starts a fresh revision chain.
@@ -534,7 +561,7 @@ pub fn apply(snapshot: &PaneSnapshot, patch: &PanePatch) -> Result<PaneSnapshot>
     for (index, cell) in &patch.changes {
         if *index >= snapshot.screen.cells.len()
             || !seen.insert(*index)
-            || !super::delta::cell_valid(cell)
+            || !kelpclient_protocol::cell_valid(cell)
         {
             return Err("invalid pane patch cell".into());
         }

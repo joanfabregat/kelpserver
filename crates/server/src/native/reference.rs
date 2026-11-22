@@ -138,7 +138,8 @@ impl State {
             | Event::ClosedSessions { .. }
             | Event::Restored { .. }
             | Event::History { .. }
-            | Event::Search { .. } => return Err("unsolicited session API event".into()),
+            | Event::Search { .. }
+            | Event::Diagnostics { .. } => return Err("unsolicited session API event".into()),
         }
         Ok(())
     }

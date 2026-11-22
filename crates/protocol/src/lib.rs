@@ -2,7 +2,6 @@
 pub mod model;
 pub mod types;
 pub use types::*;
-pub const LOCAL_PROTOCOL_VERSION: u16 = 58;
 pub const STREAM_PROTOCOL_VERSION: u16 = 1;
 pub fn cell_valid(cell: &Cell) -> bool {
     if cell.width > 2

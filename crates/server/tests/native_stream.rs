@@ -16,6 +16,7 @@ struct Daemon {
     thread: Option<thread::JoinHandle<kelpserver::Result<()>>>,
 }
 impl Daemon {
+    /// A server with two shell panes (1 and 2), created by a stream client.
     fn start() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -25,18 +26,12 @@ impl Daemon {
         ));
         fs::create_dir(&root).unwrap();
         let config = ServerConfig {
-            initial_weights: Default::default(),
-            template: None,
             socket: root.join("control.sock"),
             state_dir: root.join("state"),
             shell: "/bin/sh".into(),
             cwd: root.clone(),
             cols: 100,
             rows: 30,
-            ui: Default::default(),
-            initial_grid: (2, 1),
-            initial_tabs: None,
-            startup_panes: Default::default(),
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {
@@ -47,6 +42,21 @@ impl Daemon {
         while UnixStream::connect(daemon.root.join("control.sock")).is_err() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
+        }
+        let mut seeder = daemon.peer();
+        for (request, expected) in [("seed-1", 1), ("seed-2", 2)] {
+            seeder.send(Request::Spawn {
+                request: request.into(),
+                cwd: None,
+                argv: vec![],
+                shell: None,
+            });
+            loop {
+                if let Event::Spawned { pane, .. } = seeder.next() {
+                    assert_eq!(pane, expected);
+                    break;
+                }
+            }
         }
         daemon
     }
@@ -75,19 +85,27 @@ impl Daemon {
         }
         p
     }
+    /// The pane's current screen, observed by a separate stream client.
     fn inspect(&self, pane: u64) -> Screen {
-        let mut s = self.socket();
-        write_message(&mut s, &ClientMessage::InspectPane { pane }).unwrap();
-        match read_message(&mut s).unwrap().unwrap() {
-            ServerMessage::PaneState { screen, .. } => screen,
-            other => panic!("{other:?}"),
-        }
+        let mut observer = self.peer();
+        observer.send(Request::Subscribe { panes: vec![pane] });
+        observer.until(pane, |_| true);
+        observer.screens[&pane].screen.clone()
     }
 }
 impl Drop for Daemon {
     fn drop(&mut self) {
         if let Ok(mut s) = UnixStream::connect(self.root.join("control.sock")) {
-            let _ = write_message(&mut s, &ClientMessage::Command(Action::Shutdown));
+            for request in [
+                Request::Hello {
+                    version: stream::VERSION,
+                },
+                Request::Shutdown {
+                    request: "drop".into(),
+                },
+            ] {
+                let _ = write_message(&mut s, &ClientMessage::Stream(request));
+            }
         }
         if let Some(t) = self.thread.take() {
             assert!(t.join().unwrap().is_ok());
@@ -341,7 +359,7 @@ fn controller_theme_is_owned_per_pane_and_replaced_on_takeover() {
     );
 }
 #[test]
-fn handshake_bounds_mixed_modes_resync_and_tui_coexistence() {
+fn handshake_bounds_leases_and_resync() {
     let d = Daemon::start();
     let mut raw = d.socket();
     write_message(
@@ -373,83 +391,32 @@ fn handshake_bounds_mixed_modes_resync_and_tui_coexistence() {
         rows: 40,
     });
     a.until(1, |s| s.cols == 140);
-    let mut tui = d.socket();
-    write_message(
-        &mut tui,
-        &ClientMessage::Attach {
-            version: VERSION,
-            cols: 80,
-            rows: 24,
-            takeover: false,
-        },
-    )
-    .unwrap();
-    loop {
-        if matches!(
-            read_message::<ServerMessage>(&mut tui).unwrap(),
-            Some(ServerMessage::Welcome { .. })
-        ) {
-            break;
-        }
-    }
-    // Losing terminal focus must not steal the browser's pane back.
-    write_message(&mut tui, &ClientMessage::Input(b"\x1b[O".to_vec())).unwrap();
-    assert_eq!(d.inspect(1).cols, 140);
-    // Actual typing immediately reclaims control, geometry and the first byte.
-    write_message(
-        &mut tui,
-        &ClientMessage::Input(b"printf 'TUI_%s\\n' RESUMED\n".to_vec()),
-    )
-    .unwrap();
-    a.until(1, |screen| text(screen).contains("TUI_RESUMED"));
-    assert_ne!(d.inspect(1).cols, 140);
+    // An observer cannot type into or resize a leased pane.
+    let mut observer = d.peer();
     assert!(
-        a.error(Request::Input {
-            pane: 1,
-            bytes: vec![3]
-        })
-        .contains("lease")
+        observer
+            .error(Request::Input {
+                pane: 1,
+                bytes: b"x".to_vec(),
+            })
+            .contains("lease")
     );
-    // A browser blur racing this TUI reclaim may release an already-free pane.
-    a.send(Request::Release { pane: 1 });
-    a.lease(1, true);
-    a.send(Request::Resize {
-        pane: 1,
-        cols: 140,
-        rows: 40,
-    });
-    a.until(1, |screen| screen.cols == 140);
-    let mut observer = d.socket();
-    write_message(
-        &mut observer,
-        &ClientMessage::Attach {
-            version: VERSION,
-            cols: 80,
-            rows: 24,
-            takeover: false,
-        },
-    )
-    .unwrap();
-    loop {
-        if matches!(
-            read_message::<ServerMessage>(&mut observer).unwrap(),
-            Some(ServerMessage::Welcome { .. })
-        ) {
-            break;
-        }
-    }
-    write_message(&mut observer, &ClientMessage::Command(Action::ClaimPane(1))).unwrap();
-    loop {
-        if let Some(ServerMessage::Error(e)) = read_message(&mut observer).unwrap() {
-            assert!(e.contains("observer"));
-            break;
-        }
-    }
+    assert!(
+        observer
+            .error(Request::Resize {
+                pane: 1,
+                cols: 80,
+                rows: 24,
+            })
+            .contains("lease")
+    );
     assert_eq!(d.inspect(1).cols, 140);
-    write_message(&mut a.socket, &ClientMessage::Command(Action::Shutdown)).unwrap();
+    // The one-shot diagnostics request belongs to connections without Hello;
+    // a stream peer gets an error and keeps its connection.
+    write_message(&mut a.socket, &ClientMessage::Diagnostics).unwrap();
     loop {
         if let Some(ServerMessage::Error(e)) = read_message(&mut a.socket).unwrap() {
-            assert!(e.contains("stream peers"));
+            assert!(e.contains("stream peers"), "{e}");
             break;
         }
     }
@@ -461,7 +428,13 @@ fn handshake_bounds_mixed_modes_resync_and_tui_coexistence() {
             }
         }
     }
-    write_message(&mut tui, &ClientMessage::Action(Action::ClaimPane(1))).unwrap();
+    // A takeover moves the lease; the previous owner can no longer type.
+    observer.lease(1, true);
+    observer.send(Request::Resize {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
     while d.inspect(1).cols == 140 {
         assert!(Instant::now() < deadline);
@@ -790,14 +763,15 @@ fn structured_creation_sets_cwd_quotes_arguments_and_retries_without_stealing_a_
     fs::create_dir(&cwd).unwrap();
     let sentinel = daemon.root.join("must-not-exist");
     let argument = format!("literal '; touch {}; #", sentinel.display());
-    let request = ClientMessage::SpawnPane {
+    let request = Request::Spawn {
         request: "creation-test".into(),
-        cwd: cwd.clone(),
+        cwd: Some(cwd.clone()),
         argv: vec![
             "/usr/bin/printf".into(),
             "CREATED_%s\\n".into(),
             argument.clone(),
         ],
+        shell: None,
     };
     let mut owner = daemon.peer();
     owner.send(Request::Subscribe { panes: vec![1] });
@@ -808,81 +782,75 @@ fn structured_creation_sets_cwd_quotes_arguments_and_retries_without_stealing_a_
         rows: 8,
     });
     owner.until(1, |screen| screen.cols == 37 && screen.rows == 8);
-    let create = || {
-        let mut socket = daemon.socket();
-        write_message(&mut socket, &request).unwrap();
-        match read_message(&mut socket).unwrap().unwrap() {
-            ServerMessage::SpawnedPane { request, pane } => {
-                assert_eq!(request, "creation-test");
-                pane
+    // Each creation runs on its own connection, like separate clients.
+    let create = |request: Request| -> Result<u64, String> {
+        let mut peer = daemon.peer();
+        peer.send(request);
+        loop {
+            match peer.next() {
+                Event::Spawned { request, pane } => {
+                    assert_eq!(request, "creation-test");
+                    return Ok(pane);
+                }
+                Event::Error { message, .. } => return Err(message),
+                _ => {}
             }
-            other => panic!("{other:?}"),
         }
     };
-    let created = create();
+    let created = create(request.clone()).unwrap();
     assert_eq!(created, 3);
-    assert_eq!(create(), created);
-    let mut socket = daemon.socket();
-    write_message(&mut socket, &ClientMessage::Inspect).unwrap();
-    if let ServerMessage::State { panes, active, .. } = read_message(&mut socket).unwrap().unwrap()
-    {
-        assert_eq!(panes.len(), 3);
-        assert_eq!(active, 1);
-        let info = panes.iter().find(|p| p.id == created).unwrap();
-        assert_eq!(
-            fs::read_link(format!("/proc/{}/cwd", info.pid)).unwrap(),
-            cwd
-        );
-    } else {
-        panic!("missing state");
-    }
-    assert_eq!(daemon.inspect(1).cols, 37);
-    assert_eq!(daemon.inspect(1).rows, 8);
+    assert_eq!(create(request).unwrap(), created);
     let mut view = daemon.peer();
     view.send(Request::Subscribe {
         panes: vec![created],
     });
+    let update = loop {
+        if let Event::Update(u) = view.next() {
+            break u;
+        }
+    };
+    assert_eq!(update.panes.len(), 3);
+    let info = update.panes.iter().find(|p| p.id == created).unwrap();
+    assert_eq!(
+        fs::read_link(format!("/proc/{}/cwd", info.pid)).unwrap(),
+        cwd
+    );
+    assert_eq!(daemon.inspect(1).cols, 37);
+    assert_eq!(daemon.inspect(1).rows, 8);
     view.until(created, |screen| text(screen).contains("CREATED_literal"));
     assert!(!sentinel.exists());
-    let mut socket = daemon.socket();
-    write_message(
-        &mut socket,
-        &ClientMessage::SpawnPane {
+    // The same identifier with other parameters, and a relative directory,
+    // are rejected.
+    assert!(
+        create(Request::Spawn {
             request: "creation-test".into(),
-            cwd: cwd.clone(),
+            cwd: Some(cwd.clone()),
             argv: vec![],
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        read_message(&mut socket).unwrap(),
-        Some(ServerMessage::Error(_))
-    ));
-    let mut socket = daemon.socket();
-    write_message(
-        &mut socket,
-        &ClientMessage::SpawnPane {
+            shell: None,
+        })
+        .is_err()
+    );
+    assert!(
+        create(Request::Spawn {
             request: "bad-directory".into(),
-            cwd: PathBuf::from("relative"),
+            cwd: Some(PathBuf::from("relative")),
             argv: vec![],
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        read_message(&mut socket).unwrap(),
-        Some(ServerMessage::Error(_))
-    ));
+            shell: None,
+        })
+        .is_err()
+    );
 }
 
 #[test]
 fn shell_commands_report_their_start_return_and_alternate_screen() {
     let d = Daemon::start();
     let pane = || {
-        let mut socket = d.socket();
-        write_message(&mut socket, &ClientMessage::Inspect).unwrap();
-        match read_message(&mut socket).unwrap().unwrap() {
-            ServerMessage::State { panes, .. } => panes.into_iter().find(|p| p.id == 1).unwrap(),
-            other => panic!("{other:?}"),
+        let mut observer = d.peer();
+        observer.send(Request::Subscribe { panes: vec![] });
+        loop {
+            if let Event::Update(u) = observer.next() {
+                break u.panes.into_iter().find(|p| p.id == 1).unwrap();
+            }
         }
     };
     // A fresh peer per command keeps each lease owner's unread event stream

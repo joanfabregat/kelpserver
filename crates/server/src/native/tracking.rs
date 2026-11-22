@@ -1,8 +1,5 @@
 //! Metadata-only agent views and recovery; never launches or resumes a process.
-use super::{
-    protocol::{PaneInfo, ShellCommand},
-    ui::AgentFilter,
-};
+use super::protocol::ShellCommand;
 use crate::{
     Result,
     journal::{RETENTION, Store},
@@ -138,22 +135,6 @@ pub fn agent_terminal_title<'a>(title: &'a str, cwd: &str) -> &'a str {
         }
     }
     title
-}
-
-/// Preserve logical pane order, including ordinary shells in the unfiltered view.
-pub fn filtered(panes: &[PaneInfo], filter: AgentFilter) -> Vec<&PaneInfo> {
-    panes
-        .iter()
-        .filter(|pane| match filter {
-            AgentFilter::All => true,
-            AgentFilter::Attention => {
-                pane.kind.is_some() && matches!(pane.status, Status::InputNeeded | Status::Failed)
-            }
-            AgentFilter::Finished => {
-                pane.kind.is_some() && matches!(pane.status, Status::TurnFinished | Status::Exited)
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,12 +1,11 @@
 //! Headless terminal server commands; no TTY frontend or private web management.
 use super::{
-    connection::{connect, response},
-    protocol::*,
+    connection::{Session, connect},
     server::{self, ServerConfig},
 };
 use crate::Result;
 use std::path::{Path, PathBuf};
-pub const HELP: &str = "KelpServer: server | start | status | stop | ctl | recover | diagnostics | templates | benchmark | bridge | stream-inspect | web-relay --config PATH. Use KelpMux for attach, web-bridge and the browser client relay.";
+pub const HELP: &str = "KelpServer: server | start | status | stop | ctl list|diagnostics|shutdown | recover | diagnostics | bridge | stream-inspect | web-relay --config PATH. Servers start without panes; clients create them with the stream protocol. Use KelpMux for attach, web-bridge and the browser client relay.";
 struct Options {
     socket: PathBuf,
     state: PathBuf,
@@ -17,8 +16,6 @@ struct Options {
     server_binary: Option<PathBuf>,
     command: Vec<String>,
     background: bool,
-    settings: super::lifecycle::Settings,
-    startup_panes: super::stream::StartupPanes,
 }
 fn options(args: &[String]) -> Result<Options> {
     let state = super::lifecycle::workspace_path("main")?;
@@ -34,8 +31,6 @@ fn options(args: &[String]) -> Result<Options> {
         server_binary: None,
         command: vec![],
         background: false,
-        settings: super::lifecycle::Settings::default(),
-        startup_panes: Default::default(),
     };
     let verb = args.first().ok_or("missing native command")?;
     let mut position = 1;
@@ -45,7 +40,6 @@ fn options(args: &[String]) -> Result<Options> {
     let mut config_path = None;
     let mut shell_explicit = false;
     let mut cwd_explicit = false;
-    let mut template_path = None;
     while position < args.len() {
         let arg = &args[position];
         position += 1;
@@ -64,7 +58,6 @@ fn options(args: &[String]) -> Result<Options> {
                 "--server-binary" if verb == "start" => {
                     result.server_binary = Some(PathBuf::from(value))
                 }
-                "--template" => template_path = Some(PathBuf::from(value)),
                 "--socket" => {
                     result.socket = PathBuf::from(value);
                     socket_explicit = true;
@@ -75,20 +68,21 @@ fn options(args: &[String]) -> Result<Options> {
                 }
                 "--workspace" => workspace = Some(value.clone()),
                 "--config" => config_path = Some(PathBuf::from(value)),
-                "--shell" if matches!(verb.as_str(), "server" | "start" | "ssh-entry") => {
+                "--shell" if matches!(verb.as_str(), "server" | "start") => {
                     result.shell = PathBuf::from(value);
                     shell_explicit = true;
                 }
-                "--cwd" if matches!(verb.as_str(), "server" | "start" | "ssh-entry") => {
+                "--cwd" if matches!(verb.as_str(), "server" | "start") => {
                     result.cwd = PathBuf::from(value);
                     cwd_explicit = true;
                 }
-                "--size" if matches!(verb.as_str(), "server" | "start" | "ssh-entry") => {
+                "--size" if matches!(verb.as_str(), "server" | "start") => {
                     result.size = parse_size(value)?;
-                    validate_size(result.size.0, result.size.1)?;
+                    super::stream::validate_size(result.size.0, result.size.1)?;
                 }
+                // Accepted for compatibility: a server always starts without panes.
                 "--startup-panes" if matches!(verb.as_str(), "server" | "start") => {
-                    result.startup_panes = value.parse()?;
+                    value.parse::<super::stream::StartupPanes>()?;
                 }
                 _ => return Err(format!("unknown {verb} option {arg}").into()),
             }
@@ -105,14 +99,7 @@ fn options(args: &[String]) -> Result<Options> {
         && workspace.is_none()
         && matches!(
             verb.as_str(),
-            "attach"
-                | "ssh-entry"
-                | "status"
-                | "diagnostics"
-                | "ctl"
-                | "bridge"
-                | "web-bridge"
-                | "stream-inspect"
+            "status" | "diagnostics" | "ctl" | "bridge" | "stream-inspect"
         )
     {
         result.state = result
@@ -131,21 +118,21 @@ fn options(args: &[String]) -> Result<Options> {
     if !socket_explicit {
         result.socket = result.state.join("control.sock");
     }
-    if let Some(path) = config_path {
-        result.settings = super::lifecycle::Settings::load(&path)?;
-    } else if matches!(verb.as_str(), "start" | "ssh-entry")
-        && result.state.join("workspace.json").is_file()
-    {
-        result.settings = super::lifecycle::Settings::load(&result.state.join("workspace.json"))?;
-    }
-    if let Some(shell) = &result.settings.shell {
+    let settings = if let Some(path) = config_path {
+        super::lifecycle::Settings::load(&path)?
+    } else if verb == "start" && result.state.join("workspace.json").is_file() {
+        super::lifecycle::Settings::load(&result.state.join("workspace.json"))?
+    } else {
+        super::lifecycle::Settings::default()
+    };
+    if let Some(shell) = settings.shell {
         if !shell_explicit {
-            result.shell = shell.clone();
+            result.shell = shell;
         }
     }
-    if let Some(cwd) = &result.settings.cwd {
+    if let Some(cwd) = settings.cwd {
         if !cwd_explicit {
-            result.cwd = cwd.clone();
+            result.cwd = cwd;
         }
     }
     // Daemon children must not reinterpret relative paths after their caller exits.
@@ -156,14 +143,6 @@ fn options(args: &[String]) -> Result<Options> {
             Ok(std::env::current_dir()?.join(path))
         }
     };
-    if let Some(path) = template_path {
-        let template = super::templates::Template::load(&absolute(&path)?)?;
-        result.settings.grid = template.grid;
-        result.settings.tab_count =
-            Some(usize::from(template.grid.0) * usize::from(template.grid.1));
-        result.settings.grid_weights = [Vec::new(), Vec::new()];
-        result.settings.template = Some(template);
-    }
     result.socket = absolute(&result.socket)?;
     result.state = absolute(&result.state)?;
     result.shell = absolute(&result.shell)?;
@@ -181,7 +160,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     if args.first().is_some_and(|arg| arg == "web-relay") {
         if args.len() != 3 || args[1] != "--config" {
-            return Err("usage: kelpmux web-relay --config PATH".into());
+            return Err("usage: kelpserver web-relay --config PATH".into());
         }
         return super::web_relay::run(std::path::Path::new(&args[2]));
     }
@@ -192,18 +171,12 @@ pub fn run(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             server::serve(ServerConfig {
-                initial_weights: options.settings.grid_weights,
-                template: options.settings.template,
                 socket: options.socket,
                 state_dir: options.state,
                 shell: options.shell,
                 cwd: options.cwd,
                 cols: options.size.0,
                 rows: options.size.1,
-                ui: options.settings.ui,
-                initial_grid: options.settings.grid,
-                initial_tabs: options.settings.tab_count,
-                startup_panes: options.startup_panes,
             })
         }
         "start" => {
@@ -214,18 +187,16 @@ pub fn run(args: &[String]) -> Result<()> {
                 cwd: &options.cwd,
                 cols: options.size.0,
                 rows: options.size.1,
-                settings: &options.settings,
                 replace_running: options.replace_running,
                 executable: options.server_binary.as_deref(),
-                startup_panes: options.startup_panes,
             })?;
             control(&options.socket, &["list".into()])
         }
         "status" => {
-            let stream = connect(&options.socket)?;
-            let identity = super::upgrade::identify(&stream, &options.state)?;
+            let session = Session::open(&options.socket)?;
+            let identity = super::upgrade::identify(&session.socket, &options.state)?;
             eprintln!(
-                "Kelpmux workspace {}: server {} (protocol {}), client {} (protocol {}), PID {}",
+                "KelpServer workspace {}: server {} ({}), client {} (stream protocol {}), PID {}",
                 options
                     .state
                     .file_name()
@@ -234,26 +205,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 identity.version,
                 identity.protocol_label(),
                 env!("CARGO_PKG_VERSION"),
-                VERSION,
+                super::stream::VERSION,
                 identity.pid
             );
+            drop(session);
             control(&options.socket, &["list".into()])
         }
         "diagnostics" => control(&options.socket, &["diagnostics".into()]),
-        "templates" => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&super::templates::list(&options.state)?)?
-            );
-            Ok(())
-        }
-        "benchmark" => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&super::diagnostics::benchmark()?)?
-            );
-            Ok(())
-        }
         "bridge" => super::bridge::run(connect(&options.socket)?),
         "stream-inspect" => {
             let panes = options
@@ -265,7 +223,7 @@ pub fn run(args: &[String]) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&state)?);
             Ok(())
         }
-        "stop" => control(&options.socket, &["shutdown".into()]),
+        "stop" => super::lifecycle::stop(&options.socket),
         "recover" => {
             println!(
                 "{}",
@@ -277,38 +235,42 @@ pub fn run(args: &[String]) -> Result<()> {
         _ => Err("unknown native command".into()),
     }
 }
+/// Same-user administration over a stream connection.
 fn control(path: &Path, args: &[String]) -> Result<()> {
-    let [command, rest @ ..] = args else {
-        return Err("ctl requires a command".into());
+    let [command] = args else {
+        return Err("ctl requires one command: list, diagnostics or shutdown".into());
     };
-    let id = || -> Result<u64> {
-        if rest.len() != 1 {
-            return Err("command requires one pane ID".into());
-        }
-        Ok(rest[0].parse()?)
-    };
-    let message = match command.as_str() {
-        "list" if rest.is_empty() => ClientMessage::Inspect,
-        "diagnostics" if rest.is_empty() => ClientMessage::Diagnostics,
-        "new" if rest.is_empty() => ClientMessage::Command(Action::NewTab),
-        "park" => ClientMessage::Command(Action::Park(id()?)),
-        "restore" => ClientMessage::Command(Action::Restore(id()?)),
-        "focus" => ClientMessage::Command(Action::Focus(id()?)),
-        "reclaim" => ClientMessage::Command(Action::ClaimPane(id()?)),
-        "read" => ClientMessage::Command(Action::Read(id()?)),
-        "fullscreen" => ClientMessage::Command(Action::Fullscreen(id()?)),
-        "close" if rest.is_empty() => ClientMessage::Command(Action::CloseReading),
-        "shutdown" if rest.is_empty() => ClientMessage::Command(Action::Shutdown),
-        _ => return Err("invalid ctl command; see kelpmux --help".into()),
-    };
-    let mut socket = connect(path)?;
-    write_message(&mut socket, &message)?;
-    match response(&mut socket)? {
-        state @ (ServerMessage::State { .. } | ServerMessage::Diagnostics(_)) => {
-            println!("{}", serde_json::to_string_pretty(&state)?);
+    match command.as_str() {
+        "list" => {
+            let update = Session::open(path)?.update()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "epoch": update.epoch,
+                    "panes": update.panes,
+                    "leases": update.leases,
+                }))?
+            );
             Ok(())
         }
-        ServerMessage::Error(error) => Err(error.into()),
-        _ => Err("native server did not acknowledge the management command".into()),
+        "diagnostics" => {
+            let mut session = Session::open(path)?;
+            if !session.has("diagnostics") {
+                return Err("this server has no diagnostics request; use its matching client".into());
+            }
+            let request = session.request_id();
+            match session.request(super::stream::Request::Diagnostics { request })? {
+                super::stream::Event::Diagnostics { report, .. } => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(())
+                }
+                _ => Err("server did not return diagnostics".into()),
+            }
+        }
+        "shutdown" => super::lifecycle::stop(path),
+        _ => Err(
+            "invalid ctl command (list, diagnostics or shutdown); pane commands are stream requests"
+                .into(),
+        ),
     }
 }

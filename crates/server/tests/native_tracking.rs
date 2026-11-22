@@ -6,8 +6,7 @@ use kelpserver::{
     native::{
         hooks,
         protocol::{PaneInfo, ShellCommand},
-        tracking::{filtered, recovery_at, track_command},
-        ui::AgentFilter,
+        tracking::{recovery_at, track_command},
     },
     process,
 };
@@ -102,66 +101,6 @@ fn agent(time: u64) -> Agent {
         last_seen: time,
         ended_at: None,
     }
-}
-#[test]
-fn filters_only_agent_attention_and_completion_preserving_order() {
-    let panes = vec![
-        PaneInfo {
-            id: 1,
-            status: Status::Working,
-            ..Default::default()
-        },
-        PaneInfo {
-            id: 2,
-            status: Status::InputNeeded,
-            kind: Some(Kind::Claude),
-            ..Default::default()
-        },
-        PaneInfo {
-            id: 3,
-            status: Status::Failed,
-            ..Default::default()
-        },
-        PaneInfo {
-            id: 4,
-            status: Status::TurnFinished,
-            kind: Some(Kind::Codex),
-            ..Default::default()
-        },
-        PaneInfo {
-            id: 5,
-            status: Status::Failed,
-            kind: Some(Kind::Codex),
-            ..Default::default()
-        },
-        PaneInfo {
-            id: 6,
-            status: Status::Exited,
-            kind: Some(Kind::Claude),
-            ..Default::default()
-        },
-        PaneInfo {
-            id: 7,
-            status: Status::Idle,
-            kind: Some(Kind::Codex),
-            ..Default::default()
-        },
-    ];
-    assert_eq!(filtered(&panes, AgentFilter::All).len(), 7);
-    assert_eq!(
-        filtered(&panes, AgentFilter::Attention)
-            .iter()
-            .map(|p| p.id)
-            .collect::<Vec<_>>(),
-        vec![2, 5]
-    );
-    assert_eq!(
-        filtered(&panes, AgentFilter::Finished)
-            .iter()
-            .map(|p| p.id)
-            .collect::<Vec<_>>(),
-        vec![4, 6]
-    );
 }
 #[test]
 fn recovery_retains_known_session_transitions_and_pid_reuse_without_prompt_commands() {

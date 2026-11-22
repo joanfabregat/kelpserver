@@ -1,13 +1,16 @@
 //! A foreground, owned PTY server. Client lifetimes never own shell lifetimes.
+//!
+//! The server holds sessions only: PTYs, terminal emulation and history, pane
+//! observations, closed-session records and host sampling. Every client is a
+//! stream client (`super::stream`); presentation and UI state belong to the
+//! clients (ADR 0002).
 use super::{
     engine::{Effect, Terminal},
     protocol::*,
-    render,
-    workspace::Workspace,
 };
 use crate::{Result, discovery::Discovery, journal, model::Status, process};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
     io::{Read, Write},
     os::{
@@ -24,19 +27,15 @@ use std::{
 };
 
 pub struct ServerConfig {
-    pub initial_weights: [Vec<u16>; 2],
-    pub template: Option<super::templates::Template>,
     pub socket: PathBuf,
     pub state_dir: PathBuf,
+    /// The shell of panes created without `spawn {shell}`.
     pub shell: PathBuf,
+    /// The launch directory of panes created without `spawn {cwd}`.
     pub cwd: PathBuf,
+    /// The base pane size: panes without a lease have this size.
     pub cols: u16,
     pub rows: u16,
-    pub ui: super::ui::UiConfig,
-    pub initial_grid: (u8, u8),
-    pub initial_tabs: Option<usize>,
-    /// `None` starts without panes and leaves the saved tab layout alone.
-    pub startup_panes: super::stream::StartupPanes,
 }
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
@@ -142,6 +141,16 @@ fn valid_shell(shell: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a new pane runs and where.
+struct Launch<'a> {
+    state_dir: &'a Path,
+    shell: &'a Path,
+    cwd: &'a Path,
+    size: (u16, u16),
+    id: PaneId,
+    startup: Option<&'a str>,
+}
+
 struct NativePane {
     launch_cwd: PathBuf,
     launch_shell: PathBuf,
@@ -165,13 +174,8 @@ struct NativePane {
     spawned_by: Option<u64>,
 }
 impl NativePane {
-    fn spawn(
-        config: &ServerConfig,
-        cols: u16,
-        rows: u16,
-        id: PaneId,
-        startup: Option<&str>,
-    ) -> Result<Self> {
+    fn spawn(launch: &Launch<'_>) -> Result<Self> {
+        let (cols, rows) = launch.size;
         let mut master = -1;
         let mut slave = -1;
         let size = libc::winsize {
@@ -200,27 +204,27 @@ impl NativePane {
                 return Err(std::io::Error::last_os_error().into());
             }
         }
-        let mut command = Command::new(&config.shell);
-        super::shell::integrate_shell(&mut command, &config.state_dir, &config.shell)?;
+        let mut command = Command::new(launch.shell);
+        super::shell::integrate_shell(&mut command, launch.state_dir, launch.shell)?;
         // Agent and multiplexer session markers of whoever started the server.
         super::shell::remove_session_markers(&mut command);
         command.arg("-i");
-        if let Some(startup) = startup {
+        if let Some(startup) = launch.startup {
             command.arg("-c").arg(format!(
                 "{startup}; exec {} -i",
-                crate::shell_quote(&config.shell.to_string_lossy())
+                crate::shell_quote(&launch.shell.to_string_lossy())
             ));
         }
         command
-            .current_dir(&config.cwd)
+            .current_dir(launch.cwd)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "kelpmux")
             .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
             .env_remove("NO_COLOR")
             .env("KELPMUX", "1")
-            .env("KELPMUX_PANE", format!("%{id}"))
-            .env("KELPMUX_STATE_DIR", &config.state_dir)
+            .env("KELPMUX_PANE", format!("%{}", launch.id))
+            .env("KELPMUX_STATE_DIR", launch.state_dir)
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_CLIENT")
             .env_remove("SSH_TTY")
@@ -243,8 +247,8 @@ impl NativePane {
         }
         let child = command.spawn()?;
         let mut pane = Self {
-            launch_cwd: config.cwd.clone(),
-            launch_shell: config.shell.clone(),
+            launch_cwd: launch.cwd.to_path_buf(),
+            launch_shell: launch.shell.to_path_buf(),
             size: (cols, rows),
             child,
             master,
@@ -258,7 +262,7 @@ impl NativePane {
             terminal_title: None,
             program: None,
             created_at: crate::now(),
-            startup: startup.map(str::to_owned),
+            startup: launch.startup.map(str::to_owned),
             argv: Vec::new(),
             exit: None,
             spawned_by: None,
@@ -419,23 +423,20 @@ impl Drop for NativePane {
 }
 
 struct Client {
-    theme: [Option<[u8; 3]>; 2],
     stream: Option<StreamClient>,
-    previous_frame: Option<(u64, Frame)>,
-    full_frames: u64,
-    patch_frames: u64,
-    full_bytes: u64,
-    patch_bytes: u64,
     socket: UnixStream,
     input: Vec<u8>,
     started: Option<Instant>,
-    attached: bool,
-    geometry: Option<(u16, u16)>,
     output: VecDeque<Vec<u8>>,
     writing: Option<(Vec<u8>, usize)>,
-    frame: Option<Vec<u8>>,
+    /// The one replaceable aggregate update.
+    update: Option<Vec<u8>>,
     queued: usize,
     failed: bool,
+    /// A record the server cannot accept; reported once before closing.
+    rejected: Option<String>,
+    /// Close once the queued output (the rejection) has been written.
+    closing: bool,
 }
 struct StreamClient {
     clipboard: bool,
@@ -460,6 +461,16 @@ fn wire(message: &ServerMessage) -> Result<Vec<u8>> {
     packet.extend(bytes);
     Ok(packet)
 }
+/// The reply to a record that is not a stream request, for example a client
+/// of the composed protocol 58 that KelpServer 0.3 removed.
+fn unsupported(error: &serde_json::Error) -> String {
+    format!(
+        "KelpServer {} accepts only stream protocol requests ({{\"Stream\":{{\"type\":\"hello\",\"version\":{}}}}} first); \
+         the composed protocol 58 was removed in 0.3, use a matching client: {error}",
+        env!("CARGO_PKG_VERSION"),
+        super::stream::VERSION
+    )
+}
 impl Client {
     fn new(socket: UnixStream) -> Result<Self> {
         let mut creds: libc::ucred = unsafe { std::mem::zeroed() };
@@ -479,23 +490,17 @@ impl Client {
         }
         socket.set_nonblocking(true)?;
         Ok(Self {
-            theme: [None; 2],
             stream: None,
-            previous_frame: None,
-            full_frames: 0,
-            patch_frames: 0,
-            full_bytes: 0,
-            patch_bytes: 0,
             socket,
             input: vec![],
             started: None,
-            attached: false,
-            geometry: None,
             output: VecDeque::new(),
             writing: None,
-            frame: None,
+            update: None,
             queued: 0,
             failed: false,
+            rejected: None,
+            closing: false,
         })
     }
     fn send(&mut self, message: ServerMessage) -> Result<()> {
@@ -507,6 +512,9 @@ impl Client {
         self.output.push_back(bytes);
         Ok(())
     }
+    fn idle(&self) -> bool {
+        self.update.is_none() && self.writing.is_none() && self.output.is_empty()
+    }
     fn flush(&mut self) -> Result<()> {
         if self.failed {
             return Err("slow native client".into());
@@ -517,7 +525,7 @@ impl Client {
                 self.writing = self
                     .output
                     .pop_front()
-                    .or_else(|| self.frame.take())
+                    .or_else(|| self.update.take())
                     .map(|v| (v, 0));
             }
             let Some((bytes, offset)) = &mut self.writing else {
@@ -536,10 +544,16 @@ impl Client {
                 Err(e) => return Err(e.into()),
             }
         }
+        if self.closing && self.idle() {
+            return Err("native client rejected".into());
+        }
         Ok(())
     }
     fn receive(&mut self) -> Result<Vec<ClientMessage>> {
         let mut messages = vec![];
+        if self.closing {
+            return Ok(messages);
+        }
         let mut buf = [0; 8192];
         for pass in 0..=8 {
             loop {
@@ -553,7 +567,16 @@ impl Client {
                 if self.input.len() < n + 4 {
                     break;
                 }
-                messages.push(serde_json::from_slice(&self.input[4..n + 4])?);
+                match serde_json::from_slice(&self.input[4..n + 4]) {
+                    Ok(message) => messages.push(message),
+                    Err(error) => {
+                        // Deliver earlier records, then report this one and close.
+                        self.rejected = Some(unsupported(&error));
+                        self.closing = true;
+                        self.input.clear();
+                        return Ok(messages);
+                    }
+                }
                 self.input.drain(..n + 4);
                 self.started = if self.input.is_empty() {
                     None
@@ -591,52 +614,14 @@ impl Client {
         }
         Ok(messages)
     }
-    fn latest(&mut self, frame: &Frame) -> Result<()> {
-        let idle = self.frame.is_none() && self.writing.is_none() && self.output.is_empty();
-        if idle
-            && self
-                .previous_frame
-                .as_ref()
-                .is_some_and(|(_, old)| old == frame)
-        {
-            return Ok(());
-        }
-        let patch = if idle {
-            self.previous_frame
-                .as_ref()
-                .and_then(|(revision, old)| super::delta::diff(old, frame, *revision))
-        } else {
-            None
-        };
-        let packet = if let Some(patch) = patch {
-            let revision = patch.revision;
-            let bytes = wire(&ServerMessage::Patch(patch))?;
-            self.previous_frame = Some((revision, frame.clone()));
-            self.patch_frames += 1;
-            self.patch_bytes += bytes.len() as u64;
-            bytes
-        } else {
-            let bytes = wire(&ServerMessage::Frame(frame.clone()))?;
-            self.previous_frame = Some((1, frame.clone()));
-            self.full_frames += 1;
-            self.full_bytes += bytes.len() as u64;
-            bytes
-        };
-        if let Some(old) = self.frame.take() {
-            self.queued = self.queued.saturating_sub(old.len());
-        }
-        // An in-flight frame and one replacement are the only retained frames.
-        if self.queued + packet.len() > 2 * MAX_QUEUED {
-            return Err("slow native client".into());
-        }
-        self.queued += packet.len();
-        self.frame = Some(packet);
-        Ok(())
-    }
 }
 
+type RecoveryResult = Result<(
+    Vec<super::recovery::RecoveryItem>,
+    Vec<super::history::Entry>,
+)>;
 struct RecoveryJob {
-    receiver: std::sync::mpsc::Receiver<Result<(Vec<RecoveryItem>, Vec<super::history::Entry>)>>,
+    receiver: std::sync::mpsc::Receiver<RecoveryResult>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -654,80 +639,51 @@ struct Server {
     spawn_requests: BTreeMap<String, (PaneId, PathBuf, Vec<String>, Option<PathBuf>)>,
     /// Unused shells for `PaneSession::unused_shell`, sampled only while a
     /// stream connection has `session_events` enabled.
-    unused_shells: std::collections::BTreeSet<PaneId>,
+    unused_shells: BTreeSet<PaneId>,
     /// Closed-session records last listed for stream clients; `restore` looks
-    /// records up here so it never depends on the composed UI's list indices.
+    /// records up here by key.
     records: Vec<super::history::Entry>,
     /// Stream connections waiting for the running recovery job.
     recovery_waiters: Vec<(u64, String)>,
-    /// The running recovery job also refreshes the composed UI's lists.
-    recovery_for_ui: bool,
     history: super::history::History,
-    reopen_pending: Option<u64>,
-    remember_tab_order: bool,
-    focus_click: bool,
-    title_animation: BTreeMap<PaneId, (String, u16)>,
     epoch: String,
     leases: BTreeMap<PaneId, PaneLease>,
-    initializing: bool,
     recovery_job: Option<RecoveryJob>,
     recovery_pending: bool,
-    agent_links: Vec<crate::discovery::polling::Link>,
     discovered_agents: Vec<crate::model::Agent>,
-    poll_revision: u64,
-    agent_link_target: Option<(PaneId, u32, u64)>,
-    aliases: BTreeMap<PaneId, String>,
     activity: super::activity::Activity,
     started: Instant,
     pty_bytes: u64,
     vitals: super::vitals::Sampler,
     status: super::status::Monitor,
     config: ServerConfig,
-    workspace: Workspace,
+    /// Pane observations in creation order, as sent in `Update.panes`.
+    infos: Vec<PaneInfo>,
     panes: BTreeMap<PaneId, NativePane>,
     clients: BTreeMap<u64, Client>,
-    controller: Option<u64>,
     next_pane: u64,
     next_client: u64,
     dirty: bool,
-    notice: Option<String>,
     shutdown: bool,
 }
 impl Server {
-    fn terminal_theme(&self) -> [Option<[u8; 3]>; 2] {
-        self.controller
-            .and_then(|id| self.clients.get(&id))
-            .map_or([None; 2], |client| client.theme)
+    fn base_size(&self) -> (u16, u16) {
+        (self.config.cols, self.config.rows)
     }
     fn apply_theme(&mut self) {
-        let theme = self.terminal_theme();
         for (id, pane) in &mut self.panes {
             let colors = self
                 .leases
                 .get(id)
                 .and_then(|lease| lease.theme)
-                .map(|colors| colors.map(Some))
-                .unwrap_or(theme);
+                .map_or([None; 2], |colors| colors.map(Some));
             pane.terminal.set_theme(colors);
         }
         self.dirty = true;
     }
-    fn tui_write_allowed(&self, pane: PaneId) -> Result<()> {
-        if self.leases.contains_key(&pane) {
-            return Err("pane belongs to a native client; claim it explicitly first".into());
-        }
-        Ok(())
-    }
-    fn tui_take_pane(&mut self, pane: PaneId) {
-        if let Some(lease) = self.leases.remove(&pane) {
-            if let Some(client) = self.clients.get_mut(&lease.owner) {
-                let _ = client.send(ServerMessage::Stream(super::stream::Event::Lease {
-                    pane,
-                    owner: None,
-                }));
-            }
-            self.resize();
-            self.dirty = true;
+    fn touch(&mut self, pane: PaneId) {
+        if let Some(info) = self.infos.iter_mut().find(|info| info.id == pane) {
+            info.last_activity = crate::now();
         }
     }
     fn stream_owned(&self, client: u64, pane: PaneId) -> Result<()> {
@@ -768,7 +724,7 @@ impl Server {
             if !stream.session_events {
                 continue;
             }
-            if let Some(old) = client.frame.take() {
+            if let Some(old) = client.update.take() {
                 client.queued = client.queued.saturating_sub(old.len());
                 stream.previous.clear();
                 stream.metadata = None;
@@ -807,7 +763,7 @@ impl Server {
             worker: Some(worker),
         });
     }
-    /// Shared by `SpawnPane` administration and the stream `spawn` request.
+    /// Creates a pane for the stream `spawn` request and replacement shells.
     /// `shell` replaces the server's shell; `spawned_by` is the requesting
     /// stream connection.
     fn spawn_requested(
@@ -845,24 +801,19 @@ impl Server {
             }
             return Ok(*pane);
         }
-        let pane = self.next_pane;
         let startup = (!argv.is_empty()).then(|| {
             argv.iter()
                 .map(|arg| crate::shell_quote(arg))
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        self.spawn_pane_command(
-            Some(super::templates::TemplatePane {
-                name: "shell".into(),
-                cwd: cwd.clone(),
-                shell: shell.clone(),
-            }),
+        let pane = self.spawn_pane(
+            Some(&cwd),
+            shell.as_deref(),
             startup.as_deref(),
             argv.clone(),
             spawned_by,
         )?;
-        self.aliases.remove(&pane);
         if self.spawn_requests.len() >= 512 {
             self.spawn_requests.pop_first();
         }
@@ -887,13 +838,13 @@ impl Server {
                     .map(|s| (*s).into())
                     .collect(),
                 server_version: Some(env!("CARGO_PKG_VERSION").into()),
-                startup_panes: Some(self.config.startup_panes),
+                startup_panes: Some(super::stream::StartupPanes::None),
                 recovery_pending: self.recovery_pending,
                 limits: Some(super::stream::LIMITS),
                 notification_run: Some(self.activity.run().to_owned()),
             };
             let client = self.clients.get_mut(&id).unwrap();
-            if client.attached || client.stream.is_some() {
+            if client.stream.is_some() {
                 return Err("connection already initialized".into());
             }
             client.stream = Some(StreamClient {
@@ -1009,9 +960,7 @@ impl Server {
                     return Err("pane input too large".into());
                 }
                 self.panes.get_mut(&pane).unwrap().queue(&bytes)?;
-                if let Some(info) = self.workspace.panes.iter_mut().find(|info| info.id == pane) {
-                    info.last_activity = crate::now();
-                }
+                self.touch(pane);
             }
             Request::Paste { pane, bytes } => {
                 self.stream_owned(id, pane)?;
@@ -1031,9 +980,7 @@ impl Server {
                 } else {
                     pty.queue(&bytes)?;
                 }
-                if let Some(info) = self.workspace.panes.iter_mut().find(|info| info.id == pane) {
-                    info.last_activity = crate::now();
-                }
+                self.touch(pane);
             }
             Request::Mouse { pane, event } => {
                 self.stream_owned(id, pane)?;
@@ -1043,8 +990,7 @@ impl Server {
                 }
                 let modes = pty.terminal.snapshot().modes;
                 if modes.mouse_click || modes.mouse_drag || modes.mouse_motion {
-                    if let Some(info) = self.workspace.panes.iter_mut().find(|info| info.id == pane)
-                    {
+                    if let Some(info) = self.infos.iter_mut().find(|info| info.id == pane) {
                         info.last_activity = crate::now();
                     }
                     if event.kind == MouseKind::Move
@@ -1104,7 +1050,6 @@ impl Server {
             }
             Request::AcknowledgeAll => {
                 self.activity.acknowledge_all()?;
-                self.workspace.ui.notifications = self.activity.all().to_vec();
             }
             Request::SessionEvents { enabled } => {
                 let stream = self.clients.get_mut(&id).unwrap().stream.as_mut().unwrap();
@@ -1128,7 +1073,7 @@ impl Server {
                 self.reply(id, Event::Spawned { request, pane })?;
             }
             Request::DismissRecovery { request } => {
-                // One shared signal: the composed UI's popup is dismissed too.
+                // One shared signal for every client.
                 self.recovery_pending = false;
                 self.reply(id, Event::Done { request })?;
             }
@@ -1143,7 +1088,7 @@ impl Server {
                 {
                     return Err("pane is leased by another client".into());
                 }
-                // Closing the last pane keeps the composed UI's replacement shell.
+                // Closing the last pane first creates a replacement shell.
                 self.remove_pane(pane, true)?;
                 self.reply(id, Event::Done { request })?;
             }
@@ -1165,9 +1110,8 @@ impl Server {
                     .find(|entry| entry.key == record)
                     .cloned()
                     .ok_or("unknown closed-session record; list closed sessions again")?;
-                let (pane, existing, _) = self.restore_record(&entry, rerun, Some(id))?;
+                let (pane, existing) = self.restore_record(&entry, rerun, Some(id))?;
                 self.resize();
-                self.persist_geometry()?;
                 self.reply(
                     id,
                     Event::Restored {
@@ -1289,6 +1233,10 @@ impl Server {
                 self.reply(id, Event::Done { request })?;
                 self.stop(super::stream::StopReason::Shutdown);
             }
+            Request::Diagnostics { request } => {
+                let report = self.diagnostics();
+                self.reply(id, Event::Diagnostics { request, report })?;
+            }
             Request::Hello { .. } => unreachable!(),
         }
         self.dirty = true;
@@ -1323,8 +1271,7 @@ impl Server {
         };
         let mut removed = Vec::new();
         for (id, client) in &mut self.clients {
-            let idle =
-                client.frame.is_none() && client.writing.is_none() && client.output.is_empty();
+            let idle = client.idle();
             let Some(stream) = client.stream.as_mut() else {
                 continue;
             };
@@ -1345,7 +1292,7 @@ impl Server {
                 subscribed: stream.panes.clone(),
                 snapshots: Vec::new(),
                 patches: Vec::new(),
-                panes: self.workspace.panes.clone(),
+                panes: self.infos.clone(),
                 leases: self
                     .leases
                     .iter()
@@ -1432,7 +1379,7 @@ impl Server {
                     continue;
                 }
             };
-            if let Some(old) = client.frame.take() {
+            if let Some(old) = client.update.take() {
                 client.queued = client.queued.saturating_sub(old.len());
             }
             if client.queued + packet.len() > 2 * MAX_QUEUED {
@@ -1440,86 +1387,11 @@ impl Server {
                 continue;
             }
             client.queued += packet.len();
-            client.frame = Some(packet);
+            client.update = Some(packet);
         }
         for id in removed {
             self.remove_client(id);
         }
-    }
-    fn persist_geometry(&mut self) -> Result<()> {
-        let path = self.config.state_dir.join("workspace.json");
-        let mut settings = if path.exists() {
-            super::lifecycle::Settings::load(&path)?
-        } else {
-            super::lifecycle::Settings::default()
-        };
-        settings.ui = self.workspace.ui.config.clone();
-        // Older retained builds reject unknown UI keys. Keep the fold preference
-        // separately while continuing to save their understood expanded width.
-        settings.ui.sidebar_folded = false;
-        settings.ui.accent = super::ui::Accent::Blue;
-        let accent_path = self.config.state_dir.join("sidebar-accent.json");
-        if !self.workspace.ui.config.accent.is_default() {
-            journal::atomic(&accent_path, &self.workspace.ui.config.accent)?;
-        } else if accent_path.try_exists()? {
-            fs::remove_file(accent_path)?;
-        }
-        let folded_path = self.config.state_dir.join("sidebar-folded.json");
-        if self.workspace.ui.config.sidebar_folded {
-            journal::atomic(&folded_path, &true)?;
-        } else if folded_path.try_exists()? {
-            fs::remove_file(folded_path)?;
-        }
-        settings.shell = Some(self.config.shell.clone());
-        settings.cwd = Some(self.config.cwd.clone());
-        settings.grid = (self.workspace.grid_cols, self.workspace.grid_rows);
-        settings.grid_weights = [
-            self.workspace.ui.column_weights.clone(),
-            self.workspace.ui.row_weights.clone(),
-        ];
-        settings.template = self.config.template.clone();
-        if self.config.startup_panes == super::stream::StartupPanes::None {
-            // A stream client owns this run's panes; keep the composed UI's
-            // saved tab layout and tab count for its next startup.
-            return journal::atomic(&path, &settings);
-        }
-        let layout = self
-            .remember_tab_order
-            .then(|| super::lifecycle::TabLayout {
-                template: self.config.template.clone(),
-                cwd: self.config.cwd.clone(),
-                shell: self.config.shell.clone(),
-                panes: self
-                    .workspace
-                    .panes
-                    .iter()
-                    .filter(|p| Some(p.id) != self.workspace.ui.scratch)
-                    .filter_map(|p| {
-                        self.panes
-                            .get(&p.id)
-                            .map(|pane| super::lifecycle::StartupPane {
-                                name: self.aliases.get(&p.id).cloned(),
-                                cwd: pane.launch_cwd.clone(),
-                                shell: pane.launch_shell.clone(),
-                            })
-                    })
-                    .collect(),
-            });
-        let layout_path = self.config.state_dir.join("tab-layout.json");
-        if let Some(layout) = layout.filter(|layout| !layout.panes.is_empty()) {
-            journal::atomic(&layout_path, &layout)?;
-        } else if layout_path.try_exists()? {
-            fs::remove_file(layout_path)?;
-        }
-        settings.tab_count = Some(
-            self.workspace
-                .panes
-                .iter()
-                .filter(|p| Some(p.id) != self.workspace.ui.scratch)
-                .count()
-                .max(1),
-        );
-        journal::atomic(&path, &settings)
     }
     fn poll_recovery(&mut self) {
         let result = self
@@ -1532,487 +1404,101 @@ impl Server {
                     Some(Err("recovery worker stopped".into()))
                 }
             });
-        if let Some(result) = result {
-            match result {
-                Ok((mut entries, mut closed)) => {
-                    entries.truncate(256);
-                    for item in &entries {
-                        let e = &item.entry;
-                        if let Some(at) = e.ended_at.or_else(|| {
-                            (!process::read(Path::new("/proc"), e.pid)
-                                .is_ok_and(|p| p.start == e.process_start))
-                            .then_some(e.last_seen)
-                        }) {
-                            if closed.iter().any(|h| {
-                                h.workspace == item.workspace
-                                    && (h.session_id.is_some() && h.session_id == e.session_id
-                                        || !h.key.starts_with("legacy:")
-                                            && h.cwd == e.cwd
-                                            && h.kind == Some(e.kind)
-                                            && h.closed_at.is_some_and(|t| t.abs_diff(at) < 5))
-                            }) {
-                                continue;
-                            }
-                            closed.push(super::history::Entry {
-                                key: format!(
-                                    "legacy:{}:{}:{}",
-                                    item.workspace, e.pid, e.process_start
-                                ),
-                                workspace: item.workspace.clone(),
-                                pane: 0,
-                                cwd: e.cwd.clone(),
-                                name: e.name.clone(),
-                                kind: Some(e.kind),
-                                session_id: e.session_id.clone(),
-                                argv: vec![],
-                                closed_at: Some(at),
-                                reason: "Previous run".into(),
-                            });
-                        }
-                    }
-                    closed.retain(|e| !self.history.restored.contains(&e.key));
-                    let mut records = closed.clone();
-                    records.sort_by_key(|e| std::cmp::Reverse(e.closed_at));
-                    records.truncate(256);
-                    for (client, request) in std::mem::take(&mut self.recovery_waiters) {
-                        if let Some(client) = self.clients.get_mut(&client) {
-                            let _ = client.send(ServerMessage::Stream(
-                                super::stream::Event::ClosedSessions {
-                                    request,
-                                    records: records.iter().cloned().map(Into::into).collect(),
-                                },
-                            ));
-                        }
-                    }
-                    self.records = records;
-                    if !self.recovery_for_ui {
-                        self.recovery_job = None;
-                        return;
-                    }
-                    if self.reopen_pending.is_some() {
-                        let current = self
-                            .config
-                            .state_dir
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        closed.sort_by_key(|e| {
-                            (
-                                e.workspace != current,
-                                e.reason != "Closed",
-                                std::cmp::Reverse(e.closed_at),
-                            )
-                        });
-                    } else {
-                        closed.sort_by_key(|e| std::cmp::Reverse(e.closed_at));
-                    }
-                    closed.truncate(256);
-                    self.workspace.ui.closed_tabs = closed;
-                    self.workspace.ui.recovery = entries;
-                }
-                Err(error) => {
-                    for (client, request) in std::mem::take(&mut self.recovery_waiters) {
-                        if let Some(client) = self.clients.get_mut(&client) {
-                            let _ =
-                                client.send(ServerMessage::Stream(super::stream::Event::Error {
-                                    message: format!("closed sessions: {error}"),
-                                    request: Some(request),
-                                }));
-                        }
-                    }
-                    if !self.recovery_for_ui {
-                        self.recovery_job = None;
-                        return;
-                    }
-                    self.reopen_pending = None;
-                    self.notice = Some(format!("Recovery: {error}"));
-                }
-            }
-            self.recovery_for_ui = false;
-            self.workspace.ui.recovery_loading = false;
-            self.recovery_job = None;
-            self.dirty = true;
-            if let Some(client) = self.reopen_pending.take() {
-                if self.controller == Some(client)
-                    && self
-                        .workspace
-                        .ui
-                        .dialog
-                        .is_some_and(|d| d.kind == super::ui::DialogKind::Recovery)
-                    && !self.workspace.ui.closed_tabs.is_empty()
-                {
-                    if let Err(error) = self.feature_action(client, &Action::ReopenRequest(0)) {
-                        self.notice = Some(format!("Restore: {error}"));
+        let Some(result) = result else {
+            return;
+        };
+        self.recovery_job = None;
+        self.dirty = true;
+        let (entries, mut closed) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                for (client, request) in std::mem::take(&mut self.recovery_waiters) {
+                    if let Some(client) = self.clients.get_mut(&client) {
+                        let _ = client.send(ServerMessage::Stream(super::stream::Event::Error {
+                            message: format!("closed sessions: {error}"),
+                            request: Some(request),
+                        }));
                     }
                 }
+                return;
             }
-        }
-    }
-    fn feature_action(&mut self, client: u64, action: &Action) -> Result<bool> {
-        match action {
-            Action::TabDrag(_) | Action::GridDrag(_) => {
-                self.workspace.apply(action)?;
-                self.dirty = true;
-                return Ok(true);
-            }
-            Action::Reorder { .. } | Action::Swap { .. } => {
-                self.workspace.apply(action)?;
-                self.remember_tab_order = true;
-                self.persist_geometry()?;
-                self.resize();
-                self.dirty = true;
-                return Ok(true);
-            }
-            Action::AgentLinkPicker(pane) => {
-                let agent = self
-                    .discovered_agents
-                    .iter()
-                    .find(|agent| agent.pane == format!("%{pane}") && agent.ended_at.is_none())
-                    .ok_or("no detected agent in this tab yet")?;
-                if agent.kind != crate::model::Kind::Codex {
-                    return Err("this agent adapter does not provide a conversation picker".into());
-                }
-                self.agent_link_target = Some((*pane, agent.pid, agent.process_start));
-                self.workspace.apply(action)?;
-                self.poll_revision = self.poll_revision.wrapping_add(1);
-                self.dirty = true;
-                return Ok(true);
-            }
-            Action::AgentLinkChoose(index) => {
-                let dialog = self
-                    .workspace
-                    .ui
-                    .dialog
-                    .filter(|dialog| dialog.kind == super::ui::DialogKind::AgentLink)
-                    .ok_or("conversation picker is not open")?;
-                if self.workspace.ui.agent_link_loading {
-                    return Err("conversation list is still loading".into());
-                }
-                let pane = dialog.source.ok_or("conversation picker has no tab")?;
-                let agent = self
-                    .discovered_agents
-                    .iter()
-                    .find(|agent| agent.pane == format!("%{pane}") && agent.ended_at.is_none())
-                    .ok_or("agent has exited")?;
-                let tree = process::snapshot(Path::new("/proc"))?;
-                if self.agent_link_target != Some((pane, agent.pid, agent.process_start)) {
-                    return Err("agent process changed; reopen the picker".into());
-                }
-                let native = self.panes.get(&pane).ok_or("tab has closed")?;
-                if !tree
-                    .get(&agent.pid)
-                    .is_some_and(|process| process.start == agent.process_start)
-                    || !process::descendants(&tree, native.child.id()).contains(&agent.pid)
-                {
-                    return Err("agent process changed; reopen the picker".into());
-                }
-                let session = if *index == 0 {
-                    None
-                } else {
-                    Some(
-                        self.workspace
-                            .ui
-                            .agent_sessions
-                            .get(index - 1)
-                            .filter(|session| session.kind == agent.kind)
-                            .ok_or("conversation is no longer listed")?,
-                    )
-                };
-                self.agent_links.retain(|link| link.pane != agent.pane);
-                if let Some(session) = session {
-                    self.agent_links.push(crate::discovery::polling::Link {
-                        pane: agent.pane.clone(),
-                        pid: agent.pid,
-                        birth: agent.process_start,
-                        kind: agent.kind,
-                        session_id: session.id.clone(),
-                    });
-                }
-                self.poll_revision = self.poll_revision.wrapping_add(1);
-                self.workspace.apply(&Action::DialogClose)?;
-                self.dirty = true;
-                return Ok(true);
-            }
-            Action::StatusOpen(_)
-            | Action::StatusView(_)
-            | Action::StatusSort(_)
-            | Action::StatusQuery(_)
-            | Action::StatusScroll(_)
-            | Action::ScrollTabs(_) => {
-                self.workspace.apply(action)?;
-                self.dirty = true;
-                return Ok(true);
-            }
-            Action::Grid { .. } | Action::GridPicker | Action::ResizeGrid { .. } => {
-                return Err("grid layout is automatic; use New Tab, Park or Close".into());
-            }
-            Action::NewTab => {
-                let grid =
-                    self.workspace.reading == ReadingMode::Grid && self.workspace.active != 0;
-                // Spawn first; failure must leave every existing pane and view intact.
-                self.spawn_pane(None)?;
-                self.workspace.ui.tab_scroll_anchor = None;
-                let id = self.workspace.panes.last().unwrap().id;
-                if self.workspace.ui.scratch_visible {
-                    self.workspace.apply(&Action::ScratchClose)?;
-                }
-                self.workspace.reflow();
-                self.workspace.active = id;
-                self.workspace.reading = if grid {
-                    ReadingMode::Grid
-                } else {
-                    ReadingMode::Tabs(id)
-                };
-                self.workspace.ui.config.view_modes
-                    [super::ui::geometry_bucket(self.workspace.cols)] = Some(!grid);
-                let mut number = 0;
-                for pane in &mut self.workspace.panes {
-                    if Some(pane.id) == self.workspace.ui.scratch {
-                        pane.number = 0;
-                    } else {
-                        number += 1;
-                        pane.number = number;
-                    }
-                }
-                self.persist_geometry()?;
-            }
-            Action::Scratch => {
-                let dead = self
-                    .workspace
-                    .ui
-                    .scratch
-                    .is_some_and(|id| self.panes.get(&id).is_none_or(|pane| pane.dead));
-                if dead {
-                    if let Some(id) = self.workspace.ui.scratch.take() {
-                        if self.panes.remove(&id).is_some() {
-                            self.session_event(super::stream::Event::PaneClosed {
-                                pane: id,
-                                at: crate::now(),
-                                reason: super::stream::CloseReason::Exited,
-                                record: None,
-                            });
-                        }
-                        self.workspace.panes.retain(|pane| pane.id != id);
-                    }
-                    self.workspace.ui.scratch_visible = false;
-                }
-                if self.workspace.ui.scratch.is_none() {
-                    let active = self.workspace.active;
-                    self.spawn_pane(None)?;
-                    let id = self
-                        .workspace
-                        .panes
-                        .last()
-                        .ok_or("scratch creation failed")?
-                        .id;
-                    self.workspace.ui.scratch = Some(id);
-                    if let Some(pane) = self.workspace.panes.last_mut() {
-                        pane.title = "Scratch terminal".into();
-                    }
-                    self.workspace.active = active;
-                }
-                self.workspace.apply(action)?;
-            }
-            Action::Acknowledge(id) => {
-                self.activity.acknowledge(*id)?;
-                self.workspace.ui.notifications = self.activity.all().to_vec();
-            }
-            Action::AcknowledgeAll => {
-                self.activity.acknowledge_all()?;
-                self.workspace.ui.notifications = self.activity.all().to_vec();
-                self.workspace.apply(action)?;
-            }
-            Action::Recovery => {
-                // A job started by a stream request may already be running.
-                if self.recovery_job.is_none() || !self.recovery_for_ui {
-                    self.workspace.ui.closed_tabs.clear();
-                    self.recovery_for_ui = true;
-                    self.start_recovery();
-                    self.workspace.ui.recovery_loading = true;
-                }
-                self.workspace.apply(action)?;
-            }
-            Action::RecoveryCopy(index) => {
-                let command = self
-                    .workspace
-                    .ui
-                    .closed_tabs
-                    .get(*index)
-                    .and_then(|item| item.command())
-                    .ok_or("this session has no known resume command")?;
-                self.clients
-                    .get_mut(&client)
-                    .ok_or("unknown client")?
-                    .send(ServerMessage::Clipboard(command))?;
-            }
-            Action::ReopenLast => {
-                self.reopen_pending = Some(client);
-                return self.feature_action(client, &Action::Recovery);
-            }
-            Action::ReopenRequest(_) => {
-                self.workspace.apply(action)?;
-            }
-            Action::ReopenTab(index) | Action::RerunTab(index) => {
-                if !self.workspace.ui.dialog.is_some_and(|d| {
-                    d.kind == super::ui::DialogKind::Recovery
-                        || (d.kind == super::ui::DialogKind::ReopenConfirm
-                            && d.source == Some(*index as u64))
+        };
+        for item in entries.iter().take(256) {
+            let e = &item.entry;
+            if let Some(at) = e.ended_at.or_else(|| {
+                (!process::read(Path::new("/proc"), e.pid)
+                    .is_ok_and(|p| p.start == e.process_start))
+                .then_some(e.last_seen)
+            }) {
+                if closed.iter().any(|h| {
+                    h.workspace == item.workspace
+                        && (h.session_id.is_some() && h.session_id == e.session_id
+                            || !h.key.starts_with("legacy:")
+                                && h.cwd == e.cwd
+                                && h.kind == Some(e.kind)
+                                && h.closed_at.is_some_and(|t| t.abs_diff(at) < 5))
                 }) {
-                    return Err("select a Closed entry before restoring a tab".into());
+                    continue;
                 }
-                let entry = self
-                    .workspace
-                    .ui
-                    .closed_tabs
-                    .get(*index)
-                    .cloned()
-                    .ok_or("unknown closed tab")?;
-                self.reopen_tab(entry, matches!(action, Action::RerunTab(_)))?;
+                closed.push(super::history::Entry {
+                    key: format!("legacy:{}:{}:{}", item.workspace, e.pid, e.process_start),
+                    workspace: item.workspace.clone(),
+                    pane: 0,
+                    cwd: e.cwd.clone(),
+                    name: e.name.clone(),
+                    kind: Some(e.kind),
+                    session_id: e.session_id.clone(),
+                    argv: vec![],
+                    closed_at: Some(at),
+                    reason: "Previous run".into(),
+                });
             }
-            Action::SearchCopy(index) => {
-                let text = self
-                    .workspace
-                    .ui
-                    .search_hits
-                    .get(*index)
-                    .ok_or("unknown search result")?
-                    .text
-                    .clone();
-                self.clients
-                    .get_mut(&client)
-                    .ok_or("unknown client")?
-                    .send(ServerMessage::Clipboard(text))?;
-            }
-            Action::Search { query, all } => {
-                if query.len() > 256 || query.chars().any(char::is_control) {
-                    return Err(
-                        "search requires at most 256 bytes without control characters".into(),
-                    );
-                }
-                let mut hits = Vec::new();
-                if !query.is_empty() {
-                    for info in &self.workspace.panes {
-                        if !*all && info.id != self.workspace.active {
-                            continue;
-                        }
-                        if let Some(pane) = self.panes.get(&info.id) {
-                            for (line, text) in pane.terminal.search(query, 100 - hits.len()) {
-                                hits.push(SearchHit {
-                                    pane: info.id,
-                                    line,
-                                    text,
-                                });
-                            }
-                        }
-                        if hits.len() >= 100 {
-                            break;
-                        }
-                    }
-                }
-                self.workspace.ui.search_query = query.clone();
-                self.workspace.ui.search_all = *all;
-                self.workspace.ui.search_hits = hits;
-                if let Some(dialog) = self.workspace.ui.dialog.as_mut() {
-                    if dialog.kind == super::ui::DialogKind::Search {
-                        dialog.selection = 0;
-                    }
-                }
-                self.workspace.apply(action)?;
-            }
-            Action::SearchSelect(index) => {
-                let hit = self
-                    .workspace
-                    .ui
-                    .search_hits
-                    .get(*index)
-                    .ok_or("unknown search result")?
-                    .clone();
-                self.panes
-                    .get_mut(&hit.pane)
-                    .ok_or("search pane has closed")?
-                    .terminal
-                    .scroll_to(hit.line)?;
-                self.workspace.apply(&Action::Focus(hit.pane))?;
-                self.workspace.apply(&Action::DialogClose)?;
-            }
-            Action::SelectionStart => {
-                let pane = self
-                    .panes
-                    .get_mut(&self.workspace.active)
-                    .ok_or("no active pane")?;
-                let point = pane
-                    .terminal
-                    .snapshot()
-                    .cursor
-                    .map(|cursor| cursor.position)
-                    .unwrap_or_default();
-                pane.terminal.selection_start(point)?;
-            }
-            Action::SelectionMove { dx, dy } => {
-                self.panes
-                    .get_mut(&self.workspace.active)
-                    .ok_or("no active pane")?
-                    .terminal
-                    .selection_move(i32::from(*dx), i32::from(*dy))?;
-            }
-            _ => return Ok(false),
         }
-        self.persist_ui()?;
-        self.resize();
-        Ok(true)
-    }
-    fn close_pane(&mut self, id: PaneId) -> Result<()> {
-        self.tui_write_allowed(id)?;
-        let dialog = self
-            .workspace
-            .ui
-            .dialog
-            .ok_or("closing a pane requires confirmation")?;
-        if dialog.kind != super::ui::DialogKind::CloseConfirm || dialog.source != Some(id) {
-            return Err("closing a pane requires its confirmation dialog".into());
+        closed.retain(|e| !self.history.restored.contains(&e.key));
+        closed.sort_by_key(|e| std::cmp::Reverse(e.closed_at));
+        closed.truncate(256);
+        for (client, request) in std::mem::take(&mut self.recovery_waiters) {
+            if let Some(client) = self.clients.get_mut(&client) {
+                let _ = client.send(ServerMessage::Stream(
+                    super::stream::Event::ClosedSessions {
+                        request,
+                        records: closed.iter().cloned().map(Into::into).collect(),
+                    },
+                ));
+            }
         }
-        self.remove_pane(id, true)
+        self.records = closed;
     }
+    /// Remove a pane. `replace_last` (a client's `close`) first creates a
+    /// replacement shell for the last pane; the last pane's own exit stops
+    /// the server instead.
     fn remove_pane(&mut self, id: PaneId, replace_last: bool) -> Result<()> {
         if !self.panes.contains_key(&id) {
             return Err("unknown pane".into());
         }
-        // Preserve an interactive terminal when the last tab is closed. Create
-        // its replacement first so spawn failure cannot leave an empty workspace.
-        let is_scratch = Some(id) == self.workspace.ui.scratch;
-        let main_count = self
-            .workspace
-            .panes
+        let last = self.panes.len() == 1;
+        // Create the replacement first so a spawn failure cannot leave the
+        // closing client without a pane.
+        if last && replace_last {
+            self.spawn_pane(None, None, None, Vec::new(), None)?;
+        }
+        self.history.close(&self.epoch, id, crate::now());
+        self.history
+            .save(&self.config.state_dir.join("tab-history.json"))?;
+        let key = format!("{}:{id}", self.epoch);
+        let record = self
+            .history
+            .entries
             .iter()
-            .filter(|pane| Some(pane.id) != self.workspace.ui.scratch)
-            .count();
-        if !is_scratch && main_count == 1 && (replace_last || self.workspace.ui.scratch.is_some()) {
-            self.spawn_pane(None)?;
-        }
-        if is_scratch && self.workspace.ui.scratch_visible {
-            self.workspace.apply(&Action::ScratchClose)?;
-        }
-        self.workspace.track_focus();
-        let mut record = None;
-        if !is_scratch {
-            self.history.close(&self.epoch, id, crate::now());
-            self.history
-                .save(&self.config.state_dir.join("tab-history.json"))?;
-            let key = format!("{}:{id}", self.epoch);
-            record = self
-                .history
-                .entries
-                .iter()
-                .any(|entry| entry.key == key)
-                .then_some(key);
-        }
+            .any(|entry| entry.key == key)
+            .then_some(key);
         let reason = if self.panes[&id].dead {
             super::stream::CloseReason::Exited
         } else {
             super::stream::CloseReason::Closed
         };
         self.panes.remove(&id);
-        self.workspace.panes.retain(|pane| pane.id != id);
+        self.infos.retain(|pane| pane.id != id);
         self.leases.remove(&id);
         self.session_event(super::stream::Event::PaneClosed {
             pane: id,
@@ -2020,95 +1506,87 @@ impl Server {
             reason,
             record,
         });
-        self.aliases.remove(&id);
-        self.workspace.ui.config.pane_colors.remove(&id);
-        self.workspace.ui.unused.retain(|pane| *pane != id);
         self.unused_shells.remove(&id);
-        // Return to the previously focused tab; without one, the first.
-        let fallback = self
-            .workspace
-            .previous_focus(id)
-            .or_else(|| {
-                self.workspace
-                    .panes
-                    .iter()
-                    .find(|pane| !pane.parked && Some(pane.id) != self.workspace.ui.scratch)
-                    .map(|pane| pane.id)
-            })
-            .unwrap_or(0);
-        if is_scratch {
-            self.workspace.ui.scratch = None;
-            self.workspace.ui.scratch_visible = false;
-            self.workspace.ui.scratch_return = None;
-            self.workspace.ui.scratch_reading = None;
-        } else if self.workspace.ui.scratch_return == Some(id) {
-            self.workspace.ui.scratch_return = Some(fallback);
-        }
-        if self.workspace.active == id {
-            self.workspace.active = fallback;
-        }
-        fn replace(reading: ReadingMode, id: PaneId, fallback: PaneId) -> ReadingMode {
-            match reading {
-                ReadingMode::Tabs(pane) | ReadingMode::Capped(pane) if pane == id => {
-                    ReadingMode::Tabs(fallback)
-                }
-                ReadingMode::Fullscreen(pane) if pane == id => ReadingMode::Fullscreen(fallback),
-                other => other,
-            }
-        }
-        self.workspace.reading = replace(self.workspace.reading, id, fallback);
-        self.workspace.ui.scratch_reading = self
-            .workspace
-            .ui
-            .scratch_reading
-            .map(|reading| replace(reading, id, fallback));
-        self.workspace.ui.dialog = None;
-        if fallback == 0 {
-            self.workspace.reading = ReadingMode::Grid;
-        }
-        if !replace_last && !is_scratch && main_count == 1 && self.workspace.ui.scratch.is_none() {
+        if last && !replace_last {
             self.stop(super::stream::StopReason::LastPaneExited);
-            for client in self.clients.values_mut().filter(|client| client.attached) {
-                let _ = client.send(ServerMessage::Detached);
-            }
         }
-        for (number, pane) in self.workspace.panes.iter_mut().enumerate() {
+        for (number, pane) in self.infos.iter_mut().enumerate() {
             pane.number = number + 1;
         }
-        self.persist_ui()?;
         self.resize();
-        self.persist_geometry()?;
         Ok(())
     }
-    fn persist_ui(&mut self) -> Result<()> {
-        if self.config.ui != self.workspace.ui.config {
-            self.persist_geometry()?;
-            self.config.ui = self.workspace.ui.config.clone();
+    /// Start a pane at the base size. Without `cwd` or `shell`, the server's
+    /// launch directory and shell are used.
+    fn spawn_pane(
+        &mut self,
+        cwd: Option<&Path>,
+        shell: Option<&Path>,
+        startup: Option<&str>,
+        argv: Vec<String>,
+        spawned_by: Option<u64>,
+    ) -> Result<PaneId> {
+        let id = self.next_pane;
+        let requested = cwd.unwrap_or(&self.config.cwd);
+        let folder = launch_folder(requested, &self.config.cwd);
+        if folder != requested {
+            eprintln!(
+                "kelpserver: pane %{id}: folder {} is missing or not a directory; starting its shell in {}",
+                requested.display(),
+                folder.display()
+            );
         }
-        Ok(())
+        let shell = shell.unwrap_or(&self.config.shell).to_path_buf();
+        let mut pane = NativePane::spawn(&Launch {
+            state_dir: &self.config.state_dir,
+            shell: &shell,
+            cwd: &folder,
+            size: self.base_size(),
+            id,
+            startup,
+        })
+        .map_err(|e| {
+            format!(
+                "pane %{id}: cannot start shell {} in {}: {e}",
+                shell.display(),
+                folder.display()
+            )
+        })?;
+        pane.argv = argv;
+        pane.spawned_by = spawned_by;
+        self.infos.push(PaneInfo {
+            parked: false,
+            id,
+            number: self.infos.len() + 1,
+            pid: pane.child.id(),
+            cwd: folder.to_string_lossy().into_owned(),
+            title: "shell".into(),
+            palette: ((id - 1) % 9) as u8,
+            status: Status::Unknown,
+            session_id: None,
+            dead: false,
+            kind: None,
+            last_activity: crate::now(),
+            status_since: crate::now(),
+            observation: crate::model::Observation::default(),
+            command: None,
+        });
+        self.panes.insert(id, pane);
+        self.next_pane += 1;
+        if let Some(session) = self.pane_session(id) {
+            self.session_event(super::stream::Event::PaneCreated { session });
+        }
+        self.dirty = true;
+        Ok(id)
     }
-    fn add_pane(&mut self, index: usize) -> Result<()> {
-        let specification = self
-            .config
-            .template
-            .as_ref()
-            .and_then(|template| template.panes.get(index))
-            .filter(|_| self.initializing)
-            .cloned();
-        self.spawn_pane(specification)
-    }
-    fn spawn_pane(&mut self, specification: Option<super::templates::TemplatePane>) -> Result<()> {
-        self.spawn_pane_command(specification, None, Vec::new(), None)
-    }
-    /// The session half of restoring a closed-session record, shared by the
-    /// composed UI and the stream `restore` request. Returns the pane, whether
-    /// it already existed, and whether its original folder had disappeared.
+    /// Restore a closed-session record. Returns the pane and whether it
+    /// already existed (the conversation was already open).
     fn restore_record(
         &mut self,
         entry: &super::history::Entry,
         rerun: bool,
         spawned_by: Option<u64>,
-    ) -> Result<(PaneId, bool, bool)> {
+    ) -> Result<(PaneId, bool)> {
         let cwd = PathBuf::from(&entry.cwd);
         let command = entry
             .command()
@@ -2118,7 +1596,6 @@ impl Server {
         if !cwd.is_absolute() || (command.is_some() && !cwd.is_dir()) {
             return Err("the original folder no longer exists".into());
         }
-        let moved = !cwd.is_dir();
         if entry.kind.is_some() && entry.session_id.is_some() {
             if let Ok(records) = super::recovery::collect(&self.config.state_dir) {
                 if let Some(live) = records.iter().find(|r| {
@@ -2145,8 +1622,7 @@ impl Server {
             }
         }
         let existing = self
-            .workspace
-            .panes
+            .infos
             .iter()
             .find(|pane| {
                 entry.session_id.is_some()
@@ -2157,19 +1633,9 @@ impl Server {
         let id = if let Some(id) = existing {
             id
         } else {
-            self.spawn_pane_command(
-                Some(super::templates::TemplatePane {
-                    name: "shell".into(),
-                    cwd,
-                    shell: None,
-                }),
-                command.as_deref(),
-                Vec::new(),
-                spawned_by,
-            )?;
-            let id = self.workspace.panes.last().unwrap().id;
-            self.aliases.remove(&id);
-            if let Some(pane) = self.workspace.panes.last_mut() {
+            let id =
+                self.spawn_pane(Some(&cwd), None, command.as_deref(), Vec::new(), spawned_by)?;
+            if let Some(pane) = self.infos.iter_mut().find(|pane| pane.id == id) {
                 pane.kind = entry.kind;
                 pane.session_id = entry.session_id.clone();
                 if entry.kind.is_some() {
@@ -2181,723 +1647,69 @@ impl Server {
         self.history.consume(&entry.key);
         self.history
             .save(&self.config.state_dir.join("tab-history.json"))?;
-        self.workspace.ui.closed_tabs.retain(|e| e.key != entry.key);
         self.records.retain(|e| e.key != entry.key);
         self.dirty = true;
-        Ok((id, existing.is_some(), moved))
+        Ok((id, existing.is_some()))
     }
-    fn reopen_tab(&mut self, entry: super::history::Entry, rerun: bool) -> Result<()> {
-        let (id, existing, moved) = self.restore_record(&entry, rerun, None)?;
-        if existing {
-            if self
-                .workspace
-                .panes
-                .iter()
-                .any(|pane| pane.id == id && pane.parked)
-            {
-                self.workspace.apply(&Action::Restore(id))?;
-            }
-            if self.workspace.ui.scratch_visible {
-                self.workspace.apply(&Action::ScratchClose)?;
-            }
-            self.workspace.active = id;
-            self.workspace.reading = ReadingMode::Tabs(id);
-            self.workspace.ui.tab_scroll_anchor = None;
-            self.workspace.ui.dialog = None;
-            return Ok(());
-        }
-        if self.workspace.ui.scratch_visible {
-            self.workspace.apply(&Action::ScratchClose)?;
-        }
-        self.workspace.active = id;
-        self.workspace.reading = ReadingMode::Tabs(id);
-        self.workspace.ui.tab_scroll_anchor = None;
-        self.workspace.ui.config.view_modes[super::ui::geometry_bucket(self.workspace.cols)] =
-            Some(true);
-        self.workspace.ui.dialog = None;
-        self.persist_geometry()?;
-        if moved {
-            let folder = self.workspace.panes.last().map_or("", |pane| &pane.cwd);
-            self.notice = Some(format!("{} no longer exists; opened {folder}", entry.cwd));
-        } else if entry.kind.is_none() && !rerun {
-            self.notice = Some(format!(
-                "Reopened folder. Previous application: {}",
-                entry.name
-            ));
-        }
-        self.dirty = true;
-        Ok(())
-    }
-    fn spawn_pane_command(
-        &mut self,
-        specification: Option<super::templates::TemplatePane>,
-        startup: Option<&str>,
-        argv: Vec<String>,
-        spawned_by: Option<u64>,
-    ) -> Result<()> {
-        let id = self.next_pane;
-        let original_cwd = self.config.cwd.clone();
-        let original_shell = self.config.shell.clone();
-        let requested = specification
-            .as_ref()
-            .map_or(&self.config.cwd, |specification| &specification.cwd);
-        let cwd = launch_folder(requested, &self.config.cwd);
-        if &cwd != requested {
-            eprintln!(
-                "kelpmux: pane %{id}: folder {} is missing or not a directory; starting its shell in {}",
-                requested.display(),
-                cwd.display()
-            );
-        }
-        self.config.cwd = cwd.clone();
-        if let Some(shell) = specification.as_ref().and_then(|s| s.shell.as_ref()) {
-            self.config.shell = shell.clone();
-        }
-        let pane = NativePane::spawn(
-            &self.config,
-            self.workspace.cols,
-            self.workspace.rows.saturating_sub(2),
-            id,
-            startup,
-        )
-        .map_err(|e| {
-            format!(
-                "pane %{id}: cannot start shell {} in {}: {e}",
-                self.config.shell.display(),
-                cwd.display()
-            )
-        });
-        self.config.cwd = original_cwd;
-        self.config.shell = original_shell;
-        let mut pane = pane?;
-        pane.argv = argv;
-        pane.spawned_by = spawned_by;
-        pane.terminal.set_theme(self.terminal_theme());
-        let title = specification
-            .as_ref()
-            .map(|specification| specification.name.clone())
-            .unwrap_or_else(|| "shell".into());
-        if specification.is_some() {
-            self.aliases.insert(id, title.clone());
-        }
-        self.workspace.panes.push(PaneInfo {
-            parked: false,
-            id,
-            number: self.workspace.panes.len() + 1,
-            pid: pane.child.id(),
-            cwd: cwd.to_string_lossy().into_owned(),
-            title,
-            palette: self
-                .workspace
-                .ui
-                .config
-                .pane_colors
-                .get(&id)
-                .copied()
-                .unwrap_or(((id - 1) % 9) as u8),
-            status: Status::Unknown,
-            session_id: None,
-            dead: false,
-            kind: None,
-            last_activity: crate::now(),
-            status_since: crate::now(),
-            observation: crate::model::Observation::default(),
-            command: None,
-        });
-        self.panes.insert(id, pane);
-        self.next_pane += 1;
-        if self.workspace.active == 0 {
-            self.workspace.active = id;
-        }
-        if let Some(session) = self.pane_session(id) {
-            self.session_event(super::stream::Event::PaneCreated { session });
-        }
-        Ok(())
-    }
+    /// Leased panes have their lease's size; the others the base size.
     fn resize(&mut self) {
-        // New and reopened tabs take focus outside `Workspace::apply`.
-        self.workspace.track_focus();
-        self.workspace.reflow();
-        for (id, cols, rows) in self.workspace.terminal_sizes() {
-            if let Some(pane) = self.panes.get_mut(&id) {
-                let (cols, rows) = self
-                    .leases
-                    .get(&id)
-                    .map(|lease| lease.size)
-                    .unwrap_or((cols, rows));
-                pane.resize(cols.max(1), rows.max(1));
-            }
+        let base = self.base_size();
+        for (id, pane) in &mut self.panes {
+            let (cols, rows) = self.leases.get(id).map_or(base, |lease| lease.size);
+            pane.resize(cols.max(1), rows.max(1));
         }
         self.apply_theme();
     }
+    fn diagnostics(&self) -> super::diagnostics::Report {
+        super::diagnostics::Report {
+            version: env!("CARGO_PKG_VERSION").into(),
+            protocol: super::stream::VERSION,
+            cols: self.config.cols,
+            rows: self.config.rows,
+            panes: self.panes.len(),
+            clients: self.clients.len(),
+            uptime_seconds: self.started.elapsed().as_secs(),
+            pty_bytes: self.pty_bytes,
+        }
+    }
     fn message(&mut self, id: u64, message: ClientMessage) -> Result<()> {
-        if let ClientMessage::Stream(request) = message {
-            let correlation = request.correlation().map(str::to_owned);
-            let result = if correlation
-                .as_deref()
-                .is_some_and(|request| !super::stream::valid_request(request))
-            {
-                Err("invalid request identifier".into())
-            } else {
-                self.stream_request(id, request)
-            };
-            if let Err(error) = result {
-                if let Some(client) = self.clients.get_mut(&id) {
-                    client.send(ServerMessage::Stream(super::stream::Event::Error {
-                        message: error.to_string(),
-                        request: correlation.filter(|r| super::stream::valid_request(r)),
-                    }))?;
-                }
-            }
-            return Ok(());
-        }
-        if self.clients[&id].stream.is_some() {
-            return Err("stream peers may only send stream requests".into());
-        }
-        match message {
-            ClientMessage::SpawnPane { request, cwd, argv } => {
-                if self.clients[&id].attached && self.controller != Some(id) {
-                    return Err("observers cannot create panes".into());
-                }
-                let pane = self.spawn_requested(&request, cwd, argv, None, None)?;
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::SpawnedPane { request, pane })?;
-            }
+        let request = match message {
+            ClientMessage::Stream(request) => request,
             ClientMessage::Diagnostics => {
-                let report = super::diagnostics::Report {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    protocol: VERSION,
-                    cols: self.workspace.cols,
-                    rows: self.workspace.rows,
-                    grid: (self.workspace.grid_cols, self.workspace.grid_rows),
-                    panes: self.panes.len(),
-                    clients: self.clients.len(),
-                    uptime_seconds: self.started.elapsed().as_secs(),
-                    pty_bytes: self.pty_bytes,
-                    full_frames: self.clients.values().map(|client| client.full_frames).sum(),
-                    patch_frames: self
-                        .clients
-                        .values()
-                        .map(|client| client.patch_frames)
-                        .sum(),
-                    full_bytes: self.clients.values().map(|client| client.full_bytes).sum(),
-                    patch_bytes: self.clients.values().map(|client| client.patch_bytes).sum(),
-                };
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::Diagnostics(report))?;
-            }
-            ClientMessage::SearchPane { pane, query, limit } => {
-                if query.is_empty()
-                    || query.len() > 256
-                    || query.chars().any(char::is_control)
-                    || limit > 64
-                {
-                    return Err("invalid pane search".into());
-                }
-                let (hits, truncated) = self
-                    .panes
-                    .get(&pane)
-                    .ok_or("unknown pane")?
-                    .terminal
-                    .web_search(&query, limit);
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::PaneSearch {
-                        pane,
-                        hits,
-                        truncated,
-                    })?;
-            }
-            ClientMessage::History { pane, start, limit } => {
-                if limit > 200 {
-                    return Err("history page exceeds 200 lines".into());
-                }
-                let lines = self
-                    .panes
-                    .get(&pane)
-                    .ok_or("unknown pane")?
-                    .terminal
-                    .history(start, limit);
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::History { pane, lines })?;
-            }
-            ClientMessage::InspectPane { pane } => {
-                let info = self
-                    .workspace
-                    .panes
-                    .iter()
-                    .find(|info| info.id == pane)
-                    .ok_or("unknown pane")?
-                    .clone();
-                let screen = self
-                    .panes
-                    .get(&pane)
-                    .ok_or("unknown pane")?
-                    .terminal
-                    .snapshot();
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::PaneState { pane: info, screen })?;
-            }
-            ClientMessage::Inspect => {
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::State {
-                        panes: self.workspace.panes.clone(),
-                        active: self.workspace.active,
-                        reading: self.workspace.reading,
-                        controller: self.controller,
-                    })?
-            }
-            ClientMessage::Ping => self
-                .clients
-                .get_mut(&id)
-                .unwrap()
-                .send(ServerMessage::Pong)?,
-            ClientMessage::Command(action) => {
-                if self.clients[&id].attached && self.controller != Some(id) {
-                    return Err(
-                        "observers cannot issue management commands; take control explicitly"
+                let reply = if self.clients[&id].stream.is_some() {
+                    ServerMessage::Error(
+                        "stream peers request diagnostics with the stream diagnostics request"
                             .into(),
-                    );
-                }
-                match &action {
-                    Action::Scroll { pane, .. } | Action::SelectText { pane, .. } => {
-                        self.tui_write_allowed(*pane)?
-                    }
-                    Action::SelectionStart | Action::SelectionMove { .. } => {
-                        self.tui_write_allowed(self.workspace.active)?
-                    }
-                    Action::SearchSelect(index) => {
-                        if let Some(hit) = self.workspace.ui.search_hits.get(*index) {
-                            self.tui_write_allowed(hit.pane)?;
-                        }
-                    }
-                    _ => {}
-                }
-                if !self.feature_action(id, &action)? {
-                    match action {
-                        Action::ClaimPane(pane) => {
-                            if !self.panes.contains_key(&pane) {
-                                return Err("unknown pane".into());
-                            }
-                            self.leases.remove(&pane);
-                            self.resize();
-                        }
-                        Action::Shutdown => self.stop(super::stream::StopReason::Shutdown),
-                        Action::Grid { .. } => return Err("grid layout is automatic".into()),
-                        Action::ClosePaneConfirm(pane) => self.close_pane(pane)?,
-                        Action::Focus(_)
-                        | Action::Read(_)
-                        | Action::Fullscreen(_)
-                        | Action::CloseReading
-                        | Action::Swap { .. }
-                        | Action::Help => {
-                            self.workspace.apply(&action)?;
-                            self.persist_ui()?;
-                            self.resize();
-                        }
-                        Action::ReadResize { .. }
-                        | Action::Config
-                        | Action::TabPosition
-                        | Action::TabPositionSet(_)
-                        | Action::ClosePaneRequest(_)
-                        | Action::FocusDirection { .. }
-                        | Action::GridPicker
-                        | Action::Agents(_)
-                        | Action::MovePicker
-                        | Action::DialogNavigate { .. }
-                        | Action::DialogPick(_)
-                        | Action::DialogClose => {
-                            self.workspace.apply(&action)?;
-                            self.persist_ui()?;
-                            self.resize();
-                        }
-                        other => {
-                            self.workspace.apply(&other)?;
-                            if matches!(other, Action::ResizeGrid { .. }) {
-                                self.persist_geometry()?;
-                            }
-                            self.persist_ui()?;
-                            self.resize();
-                        }
-                    }
-                }
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::State {
-                        panes: self.workspace.panes.clone(),
-                        active: self.workspace.active,
-                        reading: self.workspace.reading,
-                        controller: self.controller,
-                    })?;
-            }
-            ClientMessage::ThemeColor { background, rgb } if self.clients[&id].attached => {
-                self.clients.get_mut(&id).unwrap().theme[usize::from(background)] = Some(rgb);
-                self.dirty = true;
-                if self.controller == Some(id) {
-                    self.apply_theme();
-                }
-            }
-            ClientMessage::Attach {
-                version,
-                cols,
-                rows,
-                takeover,
-            } => {
-                if version != VERSION {
-                    return Err("unsupported native protocol version".into());
-                }
-                validate_size(cols, rows)?;
-                if self.clients[&id].attached {
-                    return Err("client already attached".into());
-                }
-                self.clients.get_mut(&id).unwrap().attached = true;
-                self.clients.get_mut(&id).unwrap().geometry = Some((cols, rows));
-                if self.controller.is_none() || takeover {
-                    self.workspace.ui.tab_drop = None;
-                    self.controller = Some(id);
-                    self.apply_theme();
-                    self.workspace.resize(cols, rows)?;
-                    self.resize();
-                }
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::Welcome {
-                        version: VERSION,
-                        client_id: id,
-                        controller: self.controller == Some(id),
-                    })?;
-                if self.controller == Some(id) && self.recovery_pending {
-                    self.feature_action(id, &Action::Recovery)?;
-                    self.recovery_pending = false;
-                }
-                self.dirty = true;
-            }
-            ClientMessage::Action(Action::Detach) => {
-                self.clients.get_mut(&id).unwrap().attached = false;
-                if self.controller == Some(id) {
-                    self.controller = None;
-                }
-                self.clients
-                    .get_mut(&id)
-                    .unwrap()
-                    .send(ServerMessage::Detached)?;
-                self.dirty = true;
-            }
-            ClientMessage::Action(Action::Takeover) if self.clients[&id].attached => {
-                self.workspace.ui.tab_drop = None;
-                // Every explicit or focus-driven claim gets an authoritative
-                // frame, even if ownership is unchanged or another claim wins
-                // before composition. Frontends use it to finish the handoff.
-                self.clients.get_mut(&id).unwrap().previous_frame = None;
-                self.dirty = true;
-                let (cols, rows) = self.clients[&id]
-                    .geometry
-                    .ok_or("attached client has no geometry")?;
-                self.controller = Some(id);
-                self.apply_theme();
-                self.workspace.resize(cols, rows)?;
-                self.resize();
-            }
-            ClientMessage::Resize { cols, rows } if self.clients[&id].attached => {
-                validate_size(cols, rows)?;
-                self.clients.get_mut(&id).unwrap().geometry = Some((cols, rows));
-                if self.controller == Some(id) {
-                    self.workspace.resize(cols, rows)?;
-                    self.resize();
-                }
-            }
-            message => {
-                if self.controller != Some(id) || !self.clients[&id].attached {
-                    return Err("observer input refused; take control explicitly".into());
-                }
-                match message {
-                    ClientMessage::Resize { cols, rows } => {
-                        self.workspace.resize(cols, rows)?;
-                        self.resize();
-                    }
-                    ClientMessage::Input(bytes) => {
-                        if bytes.len() > MAX_INPUT {
-                            return Err("input too large".into());
-                        }
-                        if bytes == b"\x1b[O" && self.leases.contains_key(&self.workspace.active) {
-                            return Ok(());
-                        }
-                        self.tui_take_pane(self.workspace.active);
-                        self.panes
-                            .get_mut(&self.workspace.active)
-                            .ok_or("no active pane")?
-                            .queue(&bytes)?;
-                        if let Some(info) = self
-                            .workspace
-                            .panes
-                            .iter_mut()
-                            .find(|info| info.id == self.workspace.active)
-                        {
-                            info.last_activity = crate::now();
-                        }
-                        self.dirty = true;
-                    }
-                    ClientMessage::Paste(bytes) => {
-                        if bytes.len() > MAX_INPUT {
-                            return Err("paste too large".into());
-                        }
-                        self.tui_take_pane(self.workspace.active);
-                        let pane = self
-                            .panes
-                            .get_mut(&self.workspace.active)
-                            .ok_or("no active pane")?;
-                        let data = if pane.terminal.snapshot().modes.bracketed_paste {
-                            [
-                                b"\x1b[200~".as_slice(),
-                                bytes.as_slice(),
-                                b"\x1b[201~".as_slice(),
-                            ]
-                            .concat()
-                        } else {
-                            bytes
-                        };
-                        pane.queue(&data)?;
-                        if let Some(info) = self
-                            .workspace
-                            .panes
-                            .iter_mut()
-                            .find(|info| info.id == self.workspace.active)
-                        {
-                            info.last_activity = crate::now();
-                        }
-                        self.dirty = true;
-                    }
-                    ClientMessage::Mouse(mouse) => self.mouse(mouse)?,
-                    ClientMessage::Action(action) => {
-                        if let Action::ClaimPane(pane) = action {
-                            if !self.panes.contains_key(&pane) {
-                                return Err("unknown pane".into());
-                            }
-                            self.tui_take_pane(pane);
-                            return Ok(());
-                        }
-                        match &action {
-                            Action::Scroll { pane, .. } | Action::SelectText { pane, .. } => {
-                                self.tui_take_pane(*pane)
-                            }
-                            Action::SelectionStart | Action::SelectionMove { .. } => {
-                                self.tui_take_pane(self.workspace.active)
-                            }
-                            Action::SearchSelect(index) => {
-                                if let Some(hit) = self.workspace.ui.search_hits.get(*index) {
-                                    self.tui_take_pane(hit.pane);
-                                }
-                            }
-                            _ => {}
-                        }
-                        let geometry = matches!(action, Action::ResizeGrid { .. });
-                        let focus = matches!(
-                            action,
-                            Action::Focus(_)
-                                | Action::Read(_)
-                                | Action::Select(_)
-                                | Action::Fullscreen(_)
-                                | Action::FocusDirection { .. }
-                        );
-                        if !self.feature_action(id, &action)? {
-                            match action {
-                                Action::Shutdown => self.stop(super::stream::StopReason::Shutdown),
-                                Action::Grid { .. } => {
-                                    return Err("grid layout is automatic".into());
-                                }
-                                Action::ClosePaneConfirm(pane) => self.close_pane(pane)?,
-                                Action::Scroll { pane, lines } => self
-                                    .panes
-                                    .get_mut(&pane)
-                                    .ok_or("unknown pane")?
-                                    .terminal
-                                    .scroll(lines.clamp(-10000, 10000)),
-                                Action::SelectText { pane, start, end } => {
-                                    self.panes
-                                        .get_mut(&pane)
-                                        .ok_or("unknown pane")?
-                                        .terminal
-                                        .select(start, end)?;
-                                }
-                                Action::Copy(pane) => {
-                                    let text = self
-                                        .panes
-                                        .get(&pane)
-                                        .ok_or("unknown pane")?
-                                        .terminal
-                                        .selection()
-                                        .unwrap_or_default();
-                                    self.clients
-                                        .get_mut(&id)
-                                        .unwrap()
-                                        .send(ServerMessage::Clipboard(text))?;
-                                }
-                                other => self.workspace.apply(&other)?,
-                            }
-                        }
-                        if focus {
-                            self.tui_take_pane(self.workspace.active);
-                        }
-                        self.persist_ui()?;
-                        if geometry {
-                            self.persist_geometry()?;
-                        }
-                        self.resize();
-                    }
-                    _ => return Err("invalid native client message".into()),
-                }
-            }
-        }
-        self.persist_notification_reads()?;
-        Ok(())
-    }
-    fn persist_notification_reads(&mut self) -> Result<()> {
-        let ids: Vec<_> = self
-            .workspace
-            .ui
-            .notifications
-            .iter()
-            .filter(|event| {
-                event.read
-                    && self
-                        .activity
-                        .all()
-                        .iter()
-                        .any(|saved| saved.id == event.id && !saved.read)
-            })
-            .map(|event| event.id)
-            .collect();
-        for id in ids {
-            self.activity.acknowledge(id)?;
-        }
-        Ok(())
-    }
-    fn mouse(&mut self, mouse: MouseEvent) -> Result<()> {
-        if self.focus_click && matches!(mouse.kind, MouseKind::Move | MouseKind::Release) {
-            if mouse.kind == MouseKind::Release {
-                self.focus_click = false;
-            }
-            return Ok(());
-        }
-        if mouse.kind == MouseKind::Press {
-            self.focus_click = false;
-        }
-        let Some(view) = self
-            .workspace
-            .layout()
-            .into_iter()
-            .rev()
-            .find(|v| v.rect.contains(mouse.position))
-        else {
-            return Ok(());
-        };
-        if matches!(
-            mouse.kind,
-            MouseKind::Press | MouseKind::WheelUp | MouseKind::WheelDown
-        ) {
-            self.tui_take_pane(view.pane.id);
-        } else if self.leases.contains_key(&view.pane.id) {
-            return Ok(());
-        }
-        if mouse.kind == MouseKind::Press {
-            let focus_only = self.workspace.reading == ReadingMode::Grid
-                && self.workspace.active != view.pane.id;
-            self.workspace.apply(&Action::Focus(view.pane.id))?;
-            self.resize();
-            if focus_only {
-                self.focus_click = true;
-                return Ok(());
-            }
-        }
-        if !view.body.contains(mouse.position) {
-            return Ok(());
-        }
-        let pane = self
-            .panes
-            .get_mut(&view.pane.id)
-            .ok_or("unknown mouse pane")?;
-        let modes = pane.terminal.snapshot().modes;
-        if !mouse.shift && (modes.mouse_click || modes.mouse_drag || modes.mouse_motion) {
-            if let Some(info) = self
-                .workspace
-                .panes
-                .iter_mut()
-                .find(|info| info.id == view.pane.id)
-            {
-                info.last_activity = crate::now();
-            }
-            self.dirty = true;
-            if mouse.kind == MouseKind::Move
-                && !modes.mouse_motion
-                && !(modes.mouse_drag && mouse.button < 3)
-            {
-                return Ok(());
-            }
-            let mut button = match mouse.kind {
-                MouseKind::WheelUp => 64,
-                MouseKind::WheelDown => 65,
-                _ => mouse.button.min(3) as u16,
-            };
-            if mouse.kind == MouseKind::Move {
-                button += 32;
-            }
-            button += if mouse.shift { 4 } else { 0 }
-                + if mouse.alt { 8 } else { 0 }
-                + if mouse.ctrl { 16 } else { 0 };
-            let x = mouse.position.x - view.body.x + 1;
-            let y = mouse.position.y - view.body.y + 1;
-            if modes.mouse_sgr {
-                pane.queue(
-                    format!(
-                        "\x1b[<{button};{x};{y}{}",
-                        if mouse.kind == MouseKind::Release {
-                            'm'
-                        } else {
-                            'M'
-                        }
                     )
-                    .as_bytes(),
-                )?;
-            } else if x <= 223 && y <= 223 {
-                if mouse.kind == MouseKind::Release {
-                    button = 3;
-                }
-                pane.queue(&[
-                    27,
-                    b'[',
-                    b'M',
-                    button as u8 + 32,
-                    x as u8 + 32,
-                    y as u8 + 32,
-                ])?;
+                } else {
+                    ServerMessage::Diagnostics(self.diagnostics())
+                };
+                return self.clients.get_mut(&id).unwrap().send(reply);
             }
-        } else if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
-            pane.terminal.scroll(if mouse.kind == MouseKind::WheelUp {
-                3
-            } else {
-                -3
-            });
-            self.dirty = true;
+        };
+        let correlation = request.correlation().map(str::to_owned);
+        let result = if correlation
+            .as_deref()
+            .is_some_and(|request| !super::stream::valid_request(request))
+        {
+            Err("invalid request identifier".into())
+        } else {
+            self.stream_request(id, request)
+        };
+        if let Err(error) = result {
+            if let Some(client) = self.clients.get_mut(&id) {
+                client.send(ServerMessage::Stream(super::stream::Event::Error {
+                    message: error.to_string(),
+                    request: correlation.filter(|r| super::stream::valid_request(r)),
+                }))?;
+            }
         }
         Ok(())
     }
     fn poll_ptys(&mut self) {
         let mut clipboard = vec![];
         let mut exited = vec![];
-        let mut programs = std::collections::BTreeSet::new();
+        let mut programs = BTreeSet::new();
         for (id, pane) in &mut self.panes {
             let mut buf = [0; 8192];
             for _ in 0..16 {
@@ -2906,9 +1718,7 @@ impl Server {
                     Ok(n) => {
                         self.pty_bytes = self.pty_bytes.saturating_add(n as u64);
                         self.dirty = true;
-                        if let Some(info) =
-                            self.workspace.panes.iter_mut().find(|info| info.id == *id)
-                        {
+                        if let Some(info) = self.infos.iter_mut().find(|info| info.id == *id) {
                             info.last_activity = crate::now();
                         }
                         for effect in pane.terminal.feed(&buf[..n]) {
@@ -2923,12 +1733,11 @@ impl Server {
                                 Effect::Title(title) => {
                                     pane.terminal_title = (!title.is_empty())
                                         .then(|| title.chars().take(1024).collect());
-                                    // Discovery owns an agent tab's name; OSC cannot race it.
+                                    // Discovery owns an agent pane's name; OSC cannot race it.
                                     if pane.agent_named {
                                         continue;
                                     }
-                                    if let Some(info) =
-                                        self.workspace.panes.iter_mut().find(|p| p.id == *id)
+                                    if let Some(info) = self.infos.iter_mut().find(|p| p.id == *id)
                                     {
                                         let title = if info.kind.is_some() {
                                             super::tracking::agent_terminal_title(&title, &info.cwd)
@@ -2952,13 +1761,11 @@ impl Server {
                                         info.title = if info.kind.is_none() {
                                             super::tracking::shell_tab_name(
                                                 Some(title),
-                                                self.aliases.get(id).map(String::as_str),
+                                                None,
                                                 info.status == Status::Idle,
                                             )
                                         } else {
-                                            self.aliases.get(id).cloned().unwrap_or_else(|| {
-                                                title.chars().take(1024).collect()
-                                            })
+                                            title.chars().take(1024).collect()
                                         };
                                     }
                                 }
@@ -2967,11 +1774,10 @@ impl Server {
                                 }
                                 Effect::Bell => {
                                     if let Some(info) =
-                                        self.workspace.panes.iter().find(|info| info.id == *id)
+                                        self.infos.iter().find(|info| info.id == *id)
                                     {
                                         if let Err(error) = self.activity.bell(info, crate::now()) {
-                                            self.notice =
-                                                Some(format!("Notification history: {error}"));
+                                            eprintln!("kelpserver: notification history: {error}");
                                         }
                                     }
                                 }
@@ -3006,7 +1812,7 @@ impl Server {
                 exited.push(*id);
                 pane.dead = true;
                 pane.pending.clear();
-                if let Some(info) = self.workspace.panes.iter_mut().find(|p| p.id == *id) {
+                if let Some(info) = self.infos.iter_mut().find(|p| p.id == *id) {
                     info.dead = true;
                     info.status = Status::Exited;
                     info.status_since = crate::now();
@@ -3028,27 +1834,27 @@ impl Server {
                 signal,
             });
             if let Err(error) = self.remove_pane(id, false) {
-                self.notice = Some(format!("Close exited tab: {error}"));
+                eprintln!("kelpserver: close exited pane %{id}: {error}");
             }
         }
         self.refresh_programs(programs);
+        // Clipboard writes reach only the pane's lease owner, if it opted in.
         for (pane, text) in clipboard {
-            if let Some(lease) = self.leases.get(&pane) {
-                if let Some(client) = self.clients.get_mut(&lease.owner) {
-                    if client
-                        .stream
-                        .as_ref()
-                        .is_some_and(|stream| stream.clipboard)
-                    {
-                        let _ =
-                            client.send(ServerMessage::Stream(super::stream::Event::Clipboard {
-                                pane,
-                                text,
-                            }));
-                    }
+            if let Some(client) = self
+                .leases
+                .get(&pane)
+                .and_then(|lease| self.clients.get_mut(&lease.owner))
+            {
+                if client
+                    .stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.clipboard)
+                {
+                    let _ = client.send(ServerMessage::Stream(super::stream::Event::Clipboard {
+                        pane,
+                        text,
+                    }));
                 }
-            } else if let Some(client) = self.controller.and_then(|id| self.clients.get_mut(&id)) {
-                let _ = client.send(ServerMessage::Clipboard(text));
             }
         }
     }
@@ -3062,7 +1868,7 @@ impl Server {
             else {
                 continue;
             };
-            let Some(info) = self.workspace.panes.iter_mut().find(|p| p.id == id) else {
+            let Some(info) = self.infos.iter_mut().find(|p| p.id == id) else {
                 continue;
             };
             let current = self
@@ -3102,8 +1908,7 @@ impl Server {
     }
     fn discovery_snapshot(&self) -> DiscoveryRequest {
         let bridge: Vec<_> = self
-            .workspace
-            .panes
+            .infos
             .iter()
             .map(|p| crate::discovery::Pane {
                 id: format!("%{}", p.id),
@@ -3122,17 +1927,6 @@ impl Server {
                 .filter_map(|(id, pane)| pane.program.clone().map(|p| (*id, p)))
                 .collect(),
             bridge,
-            revision: self.poll_revision,
-            links: self.agent_links.clone(),
-            list_for: self
-                .workspace
-                .ui
-                .dialog
-                .filter(|dialog| {
-                    dialog.kind == super::ui::DialogKind::AgentLink
-                        && self.workspace.ui.agent_link_loading
-                })
-                .and_then(|dialog| dialog.source),
             identities: self
                 .panes
                 .iter()
@@ -3145,44 +1939,9 @@ impl Server {
             identities,
             agents: reconciled,
             tree,
-            revision,
-            sessions,
         } = result;
-        if revision != self.poll_revision {
-            return;
-        }
-        self.agent_links.retain(|link| {
-            reconciled.iter().any(|agent| {
-                agent.pane == link.pane
-                    && agent.pid == link.pid
-                    && agent.process_start == link.birth
-                    && agent.kind == link.kind
-            })
-        });
         self.discovered_agents = reconciled.clone();
-        if let Some(sessions) = sessions {
-            if self
-                .workspace
-                .ui
-                .dialog
-                .is_some_and(|dialog| dialog.kind == super::ui::DialogKind::AgentLink)
-            {
-                self.workspace.ui.agent_link_loading = false;
-                match sessions {
-                    Ok(sessions) => {
-                        self.workspace.ui.agent_sessions = sessions;
-                        self.workspace.ui.agent_link_error = None;
-                    }
-                    Err(_) => {
-                        self.workspace.ui.agent_sessions.clear();
-                        self.workspace.ui.agent_link_error =
-                            Some("Codex metadata unavailable; close and reopen to retry".into());
-                    }
-                }
-                self.dirty = true;
-            }
-        }
-        for info in &mut self.workspace.panes {
+        for info in &mut self.infos {
             if !self
                 .panes
                 .get(&info.id)
@@ -3216,11 +1975,8 @@ impl Server {
                 info.command = None;
                 info.session_id = agent.session_id.clone();
                 if let Some(pane) = self.panes.get_mut(&info.id) {
-                    let (name, authoritative) = super::tracking::tab_name(
-                        agent,
-                        pane.terminal_title.as_deref(),
-                        self.aliases.get(&info.id).map(String::as_str),
-                    );
+                    let (name, authoritative) =
+                        super::tracking::tab_name(agent, pane.terminal_title.as_deref(), None);
                     info.title = name;
                     pane.agent_named = authoritative;
                 }
@@ -3263,7 +2019,7 @@ impl Server {
                     self.panes
                         .get(&info.id)
                         .and_then(|pane| pane.terminal_title.as_deref()),
-                    self.aliases.get(&info.id).map(String::as_str),
+                    None,
                     info.status == Status::Idle,
                 );
                 info.observation = crate::model::Observation::checked(
@@ -3276,16 +2032,10 @@ impl Server {
             }
             self.dirty |= before != *info;
         }
-        self.refresh_programs(
-            self.workspace
-                .panes
-                .iter()
-                .map(|p| p.id)
-                .collect::<Vec<_>>(),
-        );
+        self.refresh_programs(self.infos.iter().map(|p| p.id).collect::<Vec<_>>());
         let mut commands = BTreeMap::new();
-        for info in &self.workspace.panes {
-            if Some(info.id) == self.workspace.ui.scratch || info.kind.is_some() {
+        for info in &self.infos {
+            if info.kind.is_some() {
                 continue;
             }
             if let Some(shell) = tree.get(&info.pid) {
@@ -3309,118 +2059,40 @@ impl Server {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        self.history.observe(
-            &self.epoch,
-            &workspace,
-            &self
-                .workspace
-                .panes
-                .iter()
-                .filter(|p| Some(p.id) != self.workspace.ui.scratch)
-                .cloned()
-                .collect::<Vec<_>>(),
-            &commands,
-        );
+        self.history
+            .observe(&self.epoch, &workspace, &self.infos, &commands);
         if self.history != old {
             if let Err(error) = self
                 .history
                 .save(&self.config.state_dir.join("tab-history.json"))
             {
-                self.notice = Some(format!("Tab history: {error}"));
+                eprintln!("kelpserver: closed-session history: {error}");
             }
         }
     }
-    fn frames(&mut self, spinner: usize) {
-        if self.controller.is_none() {
-            self.workspace.ui.tab_drop = None;
-            self.workspace.ui.grid_drop = None;
+    fn updates(&mut self) {
+        if let Err(error) = self.activity.observe(&self.infos, crate::now()) {
+            eprintln!("kelpserver: notification history: {error}");
         }
-        if let Err(error) = self.activity.observe(&self.workspace.panes, crate::now()) {
-            self.notice = Some(format!("Notification history: {error}"));
-        }
-        self.workspace.ui.notifications = self.activity.all().to_vec();
-        let attached = self.clients.values().any(|client| client.attached);
-        let streaming = self.clients.values().any(|client| client.stream.is_some());
         // Detached shells still drain PTYs and record notifications, but have
         // no display or metrics consumer. Do not snapshot their screens.
-        if !attached && !streaming {
+        if !self.clients.values().any(|client| client.stream.is_some()) {
             self.status.poll(false);
             self.dirty = false;
             return;
         }
         let vitals = self.vitals.sample();
-        let status_open = self
-            .workspace
-            .ui
-            .dialog
-            .is_some_and(|dialog| dialog.kind == super::ui::DialogKind::Status)
-            && self.clients.values().any(|client| client.attached);
         let host_wanted = self
             .clients
             .values()
             .any(|client| client.stream.as_ref().is_some_and(|stream| stream.host));
-        let host = if status_open || host_wanted {
-            Some(self.status.poll(true).clone())
+        let host = if host_wanted {
+            Some(Box::new(self.status.poll(true).clone()))
         } else {
             self.status.poll(false);
             None
         };
-        self.workspace.ui.status = host.clone().filter(|_| status_open).unwrap_or_default();
-        self.stream_frames(vitals.clone(), host.filter(|_| host_wanted).map(Box::new));
-        if !attached {
-            self.dirty = false;
-            return;
-        }
-        self.workspace.ui.disk_readings = self.vitals.disk_readings().to_vec();
-        self.workspace.ui.vitals = if self.workspace.cols <= 60
-            && self.workspace.reading == ReadingMode::Grid
-            && self.workspace.active != 0
-        {
-            let mut compact = Vec::new();
-            if let Some(cpu) = vitals.cpu {
-                compact.push((format!("C{cpu}"), 114));
-            }
-            if let Some(memory) = vitals.memory {
-                compact.push((format!("M{memory}"), 141));
-            }
-            if let Some(time) = vitals.time {
-                compact.push((time, 250));
-            }
-            compact
-        } else {
-            super::vitals::render_segments(&vitals)
-        };
-        let screens = self
-            .panes
-            .iter()
-            .map(|(id, pane)| (*id, pane.terminal.snapshot()))
-            .collect();
-        let mut presentations = BTreeMap::new();
-        let mut removed = vec![];
-        for (id, client) in &mut self.clients {
-            if client.attached {
-                let controller = self.controller == Some(*id);
-                let frame = presentations
-                    .entry((client.theme, controller))
-                    .or_insert_with(|| {
-                        let mut workspace = self.workspace.clone();
-                        workspace.ui.terminal_theme = client.theme;
-                        render::compose(
-                            &workspace,
-                            &screens,
-                            controller,
-                            self.notice.as_deref(),
-                            spinner,
-                        )
-                    });
-                if client.latest(frame).is_err() {
-                    removed.push(*id);
-                }
-            }
-        }
-        for id in removed {
-            self.remove_client(id);
-        }
+        self.stream_frames(vitals, host);
         self.dirty = false;
     }
     fn remove_client(&mut self, id: u64) {
@@ -3431,24 +2103,15 @@ impl Server {
         if before != self.leases.len() {
             self.resize();
         }
-        if self.controller == Some(id) {
-            self.controller = None;
-            self.dirty = true;
-        }
     }
 }
 
 struct DiscoveryRequest {
     programs: BTreeMap<PaneId, super::program_status::Snapshot>,
-    revision: u64,
-    links: Vec<crate::discovery::polling::Link>,
-    list_for: Option<PaneId>,
     bridge: Vec<crate::discovery::Pane>,
     identities: BTreeMap<PaneId, (u32, u64)>,
 }
 struct DiscoveryResult {
-    revision: u64,
-    sessions: Option<Result<Vec<crate::discovery::polling::Session>>>,
     identities: BTreeMap<PaneId, (u32, u64)>,
     agents: Vec<crate::model::Agent>,
     tree: BTreeMap<u32, process::Process>,
@@ -3468,7 +2131,7 @@ fn discovery_worker(
             .unwrap_or_default();
         let mut poller = crate::discovery::polling::Poller::new(Discovery::new(&home));
         while let Ok(request) = receiver.recv() {
-            let Ok(cycle) = poller.poll(&request.bridge, &request.links, crate::now()) else {
+            let Ok(cycle) = poller.poll(&request.bridge, &[], crate::now()) else {
                 continue;
             };
             let mut agents = cycle.agents;
@@ -3482,13 +2145,6 @@ fn discovery_worker(
                     snapshot.apply(agent, &cycle.tree, crate::now());
                 }
             }
-            let sessions = request.list_for.map(|pane| {
-                let agent = agents
-                    .iter()
-                    .find(|agent| agent.pane == format!("%{pane}"))
-                    .ok_or("agent has exited")?;
-                poller.sessions(agent.kind)
-            });
             // A registry client may hold the lock. Skip that journal cycle rather than wait forever.
             let root = state.join("native");
             let agents = if journal::private_dir(&root).is_ok() {
@@ -3511,8 +2167,6 @@ fn discovery_worker(
                 agents
             };
             let result = DiscoveryResult {
-                revision: request.revision,
-                sessions,
                 identities: request.identities,
                 agents,
                 tree: cycle.tree,
@@ -3525,54 +2179,21 @@ fn discovery_worker(
     (requests, results, handle)
 }
 
-pub fn serve(mut config: ServerConfig) -> Result<()> {
-    if let Some(template) = &config.template {
-        template.validate()?;
-    }
-    validate_size(config.cols, config.rows)?;
-    config.ui.validate()?;
-    Workspace::grid_count(config.initial_grid.0, config.initial_grid.1)?;
-    let mut workspace = Workspace::new(config.cols, config.rows)?;
-    workspace.ui.config = config.ui.clone();
-    if let Some(value) = std::env::var_os("KELPMUX_DEV_BADGE") {
-        workspace.ui.show_dev_badge = match value.to_str() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => return Err("KELPMUX_DEV_BADGE must be 0 or 1".into()),
-        };
-    }
+/// Run the server in the foreground until a `shutdown` request or the last
+/// pane's exit. It starts without panes; clients create them with `spawn`.
+pub fn serve(config: ServerConfig) -> Result<()> {
+    super::stream::validate_size(config.cols, config.rows)?;
     let (listener, _endpoint) = endpoint(&config)?;
-    if let Ok(folded) =
-        super::lifecycle::sidebar_folded(&config.state_dir.join("sidebar-folded.json"))
-    {
-        workspace.ui.config.sidebar_folded = folded;
-    }
-    config.ui = workspace.ui.config.clone();
-    if let Ok(accent) =
-        super::lifecycle::sidebar_accent(&config.state_dir.join("sidebar-accent.json"))
-    {
-        workspace.ui.config.accent = accent;
-        config.ui.accent = accent;
-    }
     super::lifecycle::save_pid(&config.state_dir)?;
     let mut server = Server {
         history: super::history::History::load(&config.state_dir.join("tab-history.json"))?,
-        reopen_pending: None,
-        remember_tab_order: false,
-        focus_click: false,
-        title_animation: BTreeMap::new(),
         epoch: fs::read_to_string("/proc/sys/kernel/random/uuid")?
             .trim()
             .to_owned(),
         leases: BTreeMap::new(),
-        initializing: true,
         recovery_job: None,
         recovery_pending: false,
-        agent_links: Vec::new(),
         discovered_agents: Vec::new(),
-        poll_revision: 0,
-        agent_link_target: None,
-        aliases: BTreeMap::new(),
         activity: super::activity::Activity::load(
             &config.state_dir,
             config
@@ -3586,89 +2207,28 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
         vitals: super::vitals::Sampler::default(),
         status: super::status::Monitor::default(),
         config,
-        workspace,
+        infos: Vec::new(),
         panes: BTreeMap::new(),
         clients: BTreeMap::new(),
-        controller: None,
         next_pane: 1,
         spawn_requests: BTreeMap::new(),
         unused_shells: Default::default(),
         records: Vec::new(),
         recovery_waiters: Vec::new(),
-        recovery_for_ui: false,
         next_client: 1,
         dirty: true,
-        notice: None,
         shutdown: false,
     };
     server.history.begin_run(crate::now());
     server
         .history
         .save(&server.config.state_dir.join("tab-history.json"))?;
-    server.workspace.ui.notification_run = server.activity.run().into();
-    // `--startup-panes none`: the stream client that started the server owns
-    // the initial layout and creates it with `spawn`. Nothing in the server
-    // needs a pane: the composed UI renders an empty workspace, and the last
-    // pane's exit, not an empty pane list, stops the server.
-    let startup_layout = server.config.startup_panes == super::stream::StartupPanes::Layout;
-    let count = if startup_layout {
-        server.config.initial_tabs.unwrap_or(
-            usize::from(server.config.initial_grid.0) * usize::from(server.config.initial_grid.1),
-        )
-    } else {
-        0
-    };
-    let layout = if startup_layout {
-        super::lifecycle::TabLayout::load(&server.config.state_dir.join("tab-layout.json"))
-            .ok()
-            .filter(|layout| {
-                layout.panes.len() == count
-                    && layout.template == server.config.template
-                    && layout.cwd == server.config.cwd
-                    && layout.shell == server.config.shell
-            })
-    } else {
-        None
-    };
-    server.remember_tab_order = layout.is_some();
-    for index in 0..count {
-        let result = if let Some(saved) = layout.as_ref().and_then(|layout| layout.panes.get(index))
-        {
-            let id = server.next_pane;
-            let result = server.spawn_pane(Some(super::templates::TemplatePane {
-                name: saved.name.clone().unwrap_or_else(|| "shell".into()),
-                cwd: saved.cwd.clone(),
-                shell: Some(saved.shell.clone()),
-            }));
-            if saved.name.is_none() {
-                server.aliases.remove(&id);
-            }
-            result
-        } else {
-            server.add_pane(index)
-        };
-        // One unusable saved tab must not prevent the workspace from starting.
-        if let Err(e) = result {
-            eprintln!("kelpmux: skipping startup tab {}: {e}", index + 1);
-        }
-    }
-    if startup_layout && server.workspace.panes.is_empty() {
-        // Like closing the last tab, startup always leaves one interactive shell.
-        server.spawn_pane(None)?;
-    }
-    server.initializing = false;
-    server.workspace.reflow();
-    server.persist_geometry()?;
-    server.resize();
     let unclean = super::lifecycle::begin_run(&server.config.state_dir)?;
     server.recovery_pending = unclean;
     let (requests, results, worker) = discovery_worker(server.config.state_dir.clone());
     let mut discovery = Instant::now() - Duration::from_secs(2);
     let mut render_time = Instant::now() - Duration::from_secs(1);
     let mut metrics_time = Instant::now();
-    let mut animation = Instant::now();
-    let mut title_animation_time = Instant::now();
-    let mut spinner = 0;
     let mut idle_poll = Instant::now() - Duration::from_millis(100);
     let mut unused_poll = Instant::now() - Duration::from_secs(1);
     while !server.shutdown {
@@ -3688,7 +2248,8 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
         }
         let ids: Vec<_> = server.clients.keys().copied().collect();
         for id in ids {
-            let messages = match server.clients.get_mut(&id).unwrap().receive() {
+            let client = server.clients.get_mut(&id).unwrap();
+            let messages = match client.receive() {
                 Ok(m) => m,
                 Err(_) => {
                     server.remove_client(id);
@@ -3696,36 +2257,34 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
                 }
             };
             for message in messages {
-                if let Err(e) = server.message(id, message) {
-                    if server
-                        .clients
-                        .get_mut(&id)
-                        .unwrap()
-                        .send(ServerMessage::Error(e.to_string()))
-                        .is_err()
-                    {
+                if server.message(id, message).is_err() {
+                    server.remove_client(id);
+                    break;
+                }
+            }
+            if let Some(client) = server.clients.get_mut(&id) {
+                if let Some(error) = client.rejected.take() {
+                    if client.send(ServerMessage::Error(error)).is_err() {
                         server.remove_client(id);
-                        break;
                     }
                 }
             }
         }
         server.poll_ptys();
         server.poll_recovery();
-        let attached = server.clients.values().any(|client| client.attached);
         let streaming = server
             .clients
             .values()
             .any(|client| client.stream.is_some());
-        // Stream clients with session events get the same unused-shell
-        // observation as the attached UI, under the same rate limits.
+        // The unused-shell observation is sampled only while a connection
+        // receives session data.
         let session_streaming = server.clients.values().any(|client| {
             client
                 .stream
                 .as_ref()
                 .is_some_and(|stream| stream.session_events)
         });
-        let idle_interval = if attached || session_streaming {
+        let idle_interval = if session_streaming {
             Duration::from_millis(100)
         } else {
             Duration::from_secs(1)
@@ -3742,33 +2301,17 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
             // Nobody receives the observation; never deliver a stale one later.
             server.unused_shells.clear();
         }
-        // This process-table scan only supplies unused-shell hints. Never scan
-        // the whole host ten times a second per workspace.
-        if (attached || session_streaming) && unused_poll.elapsed() >= Duration::from_millis(500) {
+        // This process-table scan only supplies unused-shell observations.
+        // Never scan the whole host ten times a second per workspace.
+        if session_streaming && unused_poll.elapsed() >= Duration::from_millis(500) {
             if let Ok(tree) = process::snapshot(Path::new("/proc")) {
-                let unused: std::collections::BTreeSet<PaneId> = server
+                let unused: BTreeSet<PaneId> = server
                     .panes
                     .iter()
                     .filter(|(_, pane)| pane.unused(&tree))
                     .map(|(id, _)| *id)
                     .collect();
-                if attached {
-                    // The composed UI leaves panes a stream client leases alone.
-                    let hints: Vec<_> = server
-                        .workspace
-                        .panes
-                        .iter()
-                        .filter(|info| {
-                            !server.leases.contains_key(&info.id) && unused.contains(&info.id)
-                        })
-                        .map(|info| info.id)
-                        .collect();
-                    if hints != server.workspace.ui.unused {
-                        server.workspace.ui.unused = hints;
-                        server.dirty = true;
-                    }
-                }
-                if session_streaming && unused != server.unused_shells {
+                if unused != server.unused_shells {
                     server.unused_shells = unused;
                     server.dirty = true;
                 }
@@ -3782,53 +2325,12 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
         if let Ok(result) = results.try_recv() {
             server.discovery_result(result);
         }
-        if attached && animation.elapsed() >= Duration::from_millis(super::ui::ANIMATION_TICK_MS) {
-            let previous = spinner;
-            spinner += 1;
-            animation = Instant::now();
-            let changed = [1, 3].into_iter().any(|width| {
-                super::ui::activity_phase(previous, width)
-                    != super::ui::activity_phase(spinner, width)
-            });
-            server.dirty |= changed
-                && server
-                    .workspace
-                    .panes
-                    .iter()
-                    .any(|p| p.status == Status::Working);
-        }
-        if attached && title_animation_time.elapsed() >= Duration::from_millis(100) {
-            title_animation_time = Instant::now();
-            server
-                .title_animation
-                .retain(|id, _| server.panes.contains_key(id));
-            server
-                .workspace
-                .ui
-                .title_ticks
-                .retain(|id, _| server.panes.contains_key(id));
-            for pane in &server.workspace.panes {
-                let entry = server
-                    .title_animation
-                    .entry(pane.id)
-                    .or_insert_with(|| (pane.title.clone(), 0));
-                if entry.0 != pane.title {
-                    *entry = (pane.title.clone(), 0);
-                }
-                let stop = (pane.title.chars().count().min(512) as u16) * 3 + 32;
-                if entry.1 <= stop {
-                    entry.1 += 1;
-                    server.workspace.ui.title_ticks.insert(pane.id, entry.1);
-                    server.dirty = true;
-                }
-            }
-        }
-        if (attached || streaming) && metrics_time.elapsed() >= Duration::from_secs(1) {
+        if streaming && metrics_time.elapsed() >= Duration::from_secs(1) {
             server.dirty = true;
             metrics_time = Instant::now();
         }
         if server.dirty && render_time.elapsed() >= Duration::from_millis(33) {
-            server.frames(spinner);
+            server.updates();
             render_time = Instant::now();
         }
         let ids: Vec<_> = server.clients.keys().copied().collect();
@@ -3868,12 +2370,12 @@ pub fn serve(mut config: ServerConfig) -> Result<()> {
             libc::poll(
                 fds.as_mut_ptr(),
                 fds.len() as libc::nfds_t,
-                if attached || streaming { 10 } else { 100 },
+                if streaming { 10 } else { 100 },
             );
         }
     }
-    // Give queued replies, `server_stopping` and `Detached` a bounded chance
-    // to reach their clients before the sockets close.
+    // Give queued replies and `server_stopping` a bounded chance to reach
+    // their clients before the sockets close.
     let deadline = Instant::now() + Duration::from_millis(200);
     while Instant::now() < deadline {
         server.clients.retain(|_, client| client.flush().is_ok());

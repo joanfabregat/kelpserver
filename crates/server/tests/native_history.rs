@@ -1,5 +1,5 @@
 use kelpclient_protocol::Cell;
-use kelpserver::native::{engine::Terminal, protocol::Point};
+use kelpserver::native::engine::Terminal;
 /// Lay out plain search-context rows as cells, mirroring the client-side
 /// `history_screen` layout (Unicode widths, combining marks, ZWJ, regional
 /// indicator pairs and skin-tone modifiers join the previous glyph; wide
@@ -125,11 +125,12 @@ fn unicode_wrapped_and_repeated_search_hits_do_not_change_the_viewport() {
     );
     term.scroll(2);
     let before = term.snapshot();
-    let hits = term.search("GHIJKLMN", 20);
+    let (hits, truncated) = term.web_search("GHIJKLMN", 20);
+    assert!(!truncated);
     assert_eq!(hits.len(), 1);
-    assert!(hits[0].1.contains("abcdefGHIJKLMN"));
-    assert_eq!(term.search("repeat target", 20).len(), 2);
-    assert_eq!(term.search("界e\u{301}", 20).len(), 1);
+    assert!(hits[0].lines.join("").contains("abcdefGHIJKLMN"));
+    assert_eq!(term.web_search("repeat target", 20).0.len(), 2);
+    assert_eq!(term.web_search("界e\u{301}", 20).0.len(), 1);
     assert_eq!(term.snapshot(), before);
     let rows = term.history(i32::MIN, 2);
     assert_eq!(rows.len(), 2);
@@ -137,79 +138,66 @@ fn unicode_wrapped_and_repeated_search_hits_do_not_change_the_viewport() {
     let next = term.history(rows[1].0 + 1, 2);
     assert!(next[0].0 > rows[1].0);
     assert_eq!(term.snapshot(), before);
-    term.scroll_to(hits[0].0).unwrap();
+    term.scroll_to(rows[0].0).unwrap();
     assert_ne!(term.snapshot(), before);
 }
 #[test]
 fn primary_history_survives_fragmented_alternate_entry_without_disturbing_alt() {
     let mut term = Terminal::new(20, 3);
     term.feed(b"primary-before\r\nprimary target\r\nthird\r\nfourth");
-    let original = term.search("primary target", 10);
-    assert_eq!(original.len(), 1);
+    let primary = |term: &Terminal| {
+        let (hits, _) = term.web_search("primary target", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "primary");
+    };
+    primary(&term);
+    let line = term
+        .history(i32::MIN, 10)
+        .into_iter()
+        .find(|(_, text)| text == "primary target")
+        .unwrap()
+        .0;
     for byte in b"\x1b[?1049h" {
         term.feed(&[*byte]);
     }
     assert!(term.is_alternate());
     term.feed(b"ALT-content");
-    assert_eq!(term.search("ALT-content", 10).len(), 1);
+    assert_eq!(term.web_search("ALT-content", 10).0.len(), 1);
     let before = term.snapshot();
-    assert_eq!(term.search("primary target", 10), original);
+    primary(&term);
     assert_eq!(term.snapshot(), before);
-    assert!(term.scroll_to(original[0].0).is_err());
+    assert!(term.scroll_to(line).is_err());
     assert_eq!(term.snapshot(), before);
     term.resize(25, 4);
-    assert_eq!(term.search("primary target", 10), original);
+    primary(&term);
     term.feed(b"\x1b[?1049l");
     assert!(!term.is_alternate());
-    assert_eq!(term.search("primary target", 10).len(), 1);
+    primary(&term);
 }
 #[test]
 fn alternate_entry_in_same_feed_preserves_text_and_exit_allows_new_primary_search() {
     let mut term = Terminal::new(12, 2);
     term.feed(b"new text\x1b[?1049hALT");
     assert!(term.is_alternate());
-    assert_eq!(term.search("new text", 10).len(), 1);
+    assert_eq!(term.web_search("new text", 10).0.len(), 1);
     term.feed(b"\x1b[?1049l\r\nnext");
     assert!(!term.is_alternate());
-    assert_eq!(term.search("next", 10).len(), 1);
+    assert_eq!(term.web_search("next", 10).0.len(), 1);
     term.resize(8, 2);
-    assert_eq!(term.search("new text", 10).len(), 1);
+    assert_eq!(term.web_search("new text", 10).0.len(), 1);
 }
 #[test]
-fn bounded_queries_and_keyboard_selection_cross_wrapped_and_history_rows() {
+fn bounded_queries_cross_wrapped_and_history_rows() {
     let mut term = Terminal::new(8, 2);
     term.feed(b"abcdefghIJK\r\nlast\r\nend");
-    assert!(term.search("", 10).is_empty());
-    assert!(term.search(&"x".repeat(257), 10).is_empty());
-    assert!(term.search("\x1b", 10).is_empty());
-    assert!(term.search("last", 0).is_empty());
+    assert!(term.web_search("", 10).0.is_empty());
+    assert!(term.web_search(&"x".repeat(257), 10).0.is_empty());
+    assert!(term.web_search("\x1b", 10).0.is_empty());
+    assert!(term.web_search("last", 0).0.is_empty());
     assert!(term.history(100, 10).is_empty());
-    assert!(term.selection_move(1, 0).is_err());
+    assert!(
+        term.web_search("ghIJ", 10).0.len() == 1,
+        "a hit across a soft wrap"
+    );
     term.scroll_to(-2).unwrap();
-    term.selection_start(Point { x: 0, y: 0 }).unwrap();
-    let selected = term.selection_move(10, 0).unwrap();
-    assert!(selected.contains("abcdefghIJK"), "{selected:?}");
-    assert_eq!(term.selection().as_deref(), Some(selected.as_str()));
-    assert!(term.selection_move(i32::MIN, i32::MIN).unwrap().len() <= 65536);
-    term.resize(10, 3);
-    assert!(term.selection_move(1, 0).is_err());
-}
-#[test]
-fn selection_tracks_new_output_and_alternate_swap_requires_a_new_anchor() {
-    let mut term = Terminal::new(10, 2);
-    term.feed(b"abcdefgh\r\nlast");
-    term.selection_start(Point { x: 0, y: 0 }).unwrap();
-    assert_eq!(term.selection_move(2, 0).unwrap(), "abc");
-    term.feed(b"\r\nmore");
-    assert_eq!(term.selection_move(1, 0).unwrap(), "abcd");
-    term.feed(b"\x1b[?1049h");
-    assert!(term.selection_move(1, 0).is_err());
-}
-#[test]
-fn backward_selection_includes_both_edges_and_can_reverse_direction() {
-    let mut term = Terminal::new(20, 2);
-    term.feed(b"SELECT_ME++");
-    term.selection_start(Point { x: 8, y: 0 }).unwrap();
-    assert_eq!(term.selection_move(-8, 0).unwrap(), "SELECT_ME");
-    assert_eq!(term.selection_move(10, 0).unwrap(), "E++");
 }

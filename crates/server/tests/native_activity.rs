@@ -1,11 +1,7 @@
 use kelpserver::{
     journal::RETENTION,
     model::{Kind, Status},
-    native::{
-        activity::{Activity, next},
-        protocol::PaneInfo,
-        ui::AgentFilter,
-    },
+    native::{activity::Activity, protocol::PaneInfo},
 };
 use std::{
     fs,
@@ -55,10 +51,6 @@ fn pending_background_work_has_a_static_indicator_and_no_completion_alert() {
         .observe(std::slice::from_ref(&agent), time + 1)
         .unwrap();
     assert!(activity.all().is_empty());
-    assert_eq!(
-        kelpserver::native::ui::pane_indicator(&Default::default(), &agent),
-        Some("◌")
-    );
     assert_eq!(agent.status.text(), "WAITING IN BACKGROUND");
 }
 #[test]
@@ -223,7 +215,7 @@ fn notification_storage_is_bounded_and_retained_for_seven_days() {
     assert!(maximum >= 300);
 }
 #[test]
-fn bell_requires_agent_identity_is_throttled_and_cycling_uses_logical_agents() {
+fn bell_requires_agent_identity_and_is_throttled() {
     let fixture = Fixture::new();
     let mut activity = Activity::load(&fixture.0, "test").unwrap();
     let time = kelpserver::now();
@@ -238,16 +230,6 @@ fn bell_requires_agent_identity_is_throttled_and_cycling_uses_logical_agents() {
     assert!(!activity.bell(&agent, time + 1).unwrap());
     assert!(activity.bell(&agent, time + 2).unwrap());
     assert_eq!(activity.all()[0].status, Status::Unknown);
-    let panes = vec![
-        shell,
-        pane(8, Status::InputNeeded),
-        pane(2, Status::TurnFinished),
-        pane(3, Status::Failed),
-    ];
-    assert_eq!(next(&panes, AgentFilter::Attention, 8), Some(3));
-    assert_eq!(next(&panes, AgentFilter::Attention, 3), Some(8));
-    assert_eq!(next(&panes, AgentFilter::Finished, 1), Some(2));
-    assert_eq!(next(&panes, AgentFilter::All, 2), Some(3));
 }
 #[test]
 fn corrupt_oversized_symlink_and_invalid_observations_fail_clearly() {

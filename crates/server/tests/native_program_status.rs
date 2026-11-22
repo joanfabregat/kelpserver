@@ -5,6 +5,7 @@ use kelpserver::{
         engine::{Effect, Terminal},
         program_status::{Event, Parser, REPLY, Records},
         protocol::*,
+        stream::{self, Request},
     },
 };
 use std::{
@@ -155,21 +156,67 @@ impl Fixture {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Self {
+        let fixture = Self {
             root,
             socket,
             child,
-        }
+        };
+        fixture.spawn();
+        fixture
     }
-    fn pane(&self) -> Option<PaneInfo> {
+    /// A stream connection after Hello/Welcome.
+    fn session(&self) -> Option<UnixStream> {
         let mut socket = UnixStream::connect(&self.socket).ok()?;
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        write_message(&mut socket, &ClientMessage::Inspect).unwrap();
-        match read_message(&mut socket).unwrap()? {
-            ServerMessage::State { panes, .. } => panes.into_iter().next(),
-            _ => None,
+        let hello = Request::Hello {
+            version: stream::VERSION,
+        };
+        write_message(&mut socket, &ClientMessage::Stream(hello)).ok()?;
+        loop {
+            match read_message(&mut socket).ok()?? {
+                ServerMessage::Stream(stream::Event::Welcome { .. }) => return Some(socket),
+                ServerMessage::Stream(_) => {}
+                _ => return None,
+            }
+        }
+    }
+    /// The server starts without panes; create the fixture's one shell.
+    fn spawn(&self) {
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            if let Some(socket) = self.session() {
+                break socket;
+            }
+            assert!(Instant::now() < until, "server did not start");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let spawn = Request::Spawn {
+            request: "fixture".into(),
+            cwd: None,
+            argv: vec![],
+            shell: None,
+        };
+        write_message(&mut socket, &ClientMessage::Stream(spawn)).unwrap();
+        loop {
+            if let Some(ServerMessage::Stream(stream::Event::Spawned { .. })) =
+                read_message(&mut socket).unwrap()
+            {
+                return;
+            }
+        }
+    }
+    fn pane(&self) -> Option<PaneInfo> {
+        let mut socket = self.session()?;
+        let subscribe = Request::Subscribe { panes: vec![] };
+        write_message(&mut socket, &ClientMessage::Stream(subscribe)).ok()?;
+        loop {
+            if let ServerMessage::Stream(stream::Event::Update(update)) =
+                read_message(&mut socket).ok()??
+            {
+                return update.panes.into_iter().next();
+            }
         }
     }
     fn wait(&self, wanted: Status) -> PaneInfo {
@@ -192,7 +239,14 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Ok(mut socket) = UnixStream::connect(&self.socket) {
-            let _ = write_message(&mut socket, &ClientMessage::Command(Action::Shutdown));
+            let hello = Request::Hello {
+                version: stream::VERSION,
+            };
+            let shutdown = Request::Shutdown {
+                request: "drop".into(),
+            };
+            let _ = write_message(&mut socket, &ClientMessage::Stream(hello));
+            let _ = write_message(&mut socket, &ClientMessage::Stream(shutdown));
         }
         for _ in 0..200 {
             if self.child.try_wait().ok().flatten().is_some() {

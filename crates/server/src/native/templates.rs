@@ -1,4 +1,6 @@
-//! Declarative shell workspaces. Templates contain no agent commands or IDs.
+//! Declarative shell workspace templates (a client startup layout format).
+//! The server no longer reads them: since 0.3 it starts without panes. Kept
+//! for KelpMux until it owns its startup layout; not part of the session API.
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::{

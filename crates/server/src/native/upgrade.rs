@@ -16,6 +16,11 @@ use std::{
     process::Command,
 };
 
+/// The local protocol number recorded by servers of the composed protocol
+/// (KelpServer 0.2 and KelpMux before the split). Those servers also speak
+/// stream protocol 1.
+pub const LEGACY_COMPOSED_PROTOCOL: u16 = 58;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub pid: u32,
@@ -24,16 +29,23 @@ pub struct Identity {
     pub inode: u64,
     pub executable: PathBuf,
     pub version: String,
+    /// The protocol the server speaks on its socket: the stream protocol
+    /// version (1) since KelpServer 0.3, `LEGACY_COMPOSED_PROTOCOL` for
+    /// servers of the composed protocol, 0 for unknown legacy metadata.
     pub protocol: u16,
 }
 impl Identity {
     /// Zero denotes unavailable legacy metadata, never a supported protocol.
     pub fn protocol_label(&self) -> String {
-        if self.protocol == 0 {
-            "unknown".into()
-        } else {
-            self.protocol.to_string()
+        match self.protocol {
+            0 => "protocol unknown".into(),
+            LEGACY_COMPOSED_PROTOCOL => format!("local protocol {LEGACY_COMPOSED_PROTOCOL}"),
+            version => format!("stream protocol {version}"),
         }
+    }
+    /// Whether a stream client of this build can use the server.
+    pub fn speaks_stream(&self) -> bool {
+        self.protocol == super::stream::VERSION || self.protocol == LEGACY_COMPOSED_PROTOCOL
     }
 }
 
@@ -65,7 +77,7 @@ fn process(pid: u32) -> Result<Identity> {
 pub fn save(state: &Path) -> Result<()> {
     let mut identity = process(std::process::id())?;
     identity.version = env!("CARGO_PKG_VERSION").into();
-    identity.protocol = super::protocol::VERSION;
+    identity.protocol = super::stream::VERSION;
     journal::atomic(&state.join("server.identity.json"), &identity)
 }
 
@@ -152,7 +164,7 @@ pub fn matching_binary(
             .file_name()
             .is_none_or(|name| name != "kelpmux")
     {
-        return Err(format!("workspace runs Kelpmux {} (protocol {}); its matching client is outside the trusted versions directory {}; existing sessions are unchanged", identity.version, identity.protocol_label(), versions.display()).into());
+        return Err(format!("workspace runs Kelpmux {} ({}); its matching client is outside the trusted versions directory {}; existing sessions are unchanged", identity.version, identity.protocol_label(), versions.display()).into());
     }
     for path in identity.executable.ancestors() {
         let meta = fs::symlink_metadata(path)?;
@@ -199,8 +211,13 @@ pub fn attach_matching(socket: &Path, state: &Path, takeover: bool) -> Result<Un
         .file_name()
         .is_some_and(|name| name == "kelpserver")
     {
-        if identity.protocol != super::protocol::VERSION {
-            return Err("KelpServer protocol is incompatible; install a matching KelpMux client; sessions are unchanged".into());
+        if !identity.speaks_stream() {
+            return Err(format!(
+                "KelpServer {} ({}) is incompatible with this client; install a matching client; sessions are unchanged",
+                identity.version,
+                identity.protocol_label()
+            )
+            .into());
         }
         return Ok(stream);
     }
@@ -228,7 +245,7 @@ pub fn attach_matching(socket: &Path, state: &Path, takeover: bool) -> Result<Un
             );
         }
         eprintln!(
-            "Kelpmux workspace: using retained client {} (protocol {}); server remains running",
+            "Kelpmux workspace: using retained client {} ({}); server remains running",
             identity.version,
             identity.protocol_label()
         );

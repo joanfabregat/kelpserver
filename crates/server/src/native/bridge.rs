@@ -137,7 +137,9 @@ impl Incoming {
                     return Err("duplicate bridge hello".into());
                 }
             } else {
-                match serde_json::from_slice::<ServerMessage>(payload)? {
+                match serde_json::from_slice::<ServerMessage>(payload)
+                    .map_err(|_| "workspace did not speak the native stream protocol")?
+                {
                     ServerMessage::Stream(stream::Event::Welcome {
                         version,
                         client,

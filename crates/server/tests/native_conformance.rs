@@ -1,5 +1,5 @@
 //! Hand-authored, content-free terminal compatibility fixtures.
-use kelpserver::native::{engine::Terminal, protocol::*, render::terminal_diff};
+use kelpserver::native::{engine::Terminal, protocol::*};
 
 fn fixtures() -> impl Iterator<Item = String> {
     [
@@ -8,21 +8,6 @@ fn fixtures() -> impl Iterator<Item = String> {
     ]
     .into_iter()
     .map(|json| serde_json::from_str(json).unwrap())
-}
-fn frame(screen: Screen) -> Frame {
-    Frame {
-        cols: screen.cols,
-        rows: screen.rows,
-        cells: screen.cells,
-        cursor: screen.cursor,
-        panes: vec![],
-        active: 0,
-        reading: ReadingMode::Grid,
-        controller: true,
-        help: false,
-        notice: None,
-        ui: Default::default(),
-    }
 }
 #[test]
 fn every_fixture_split_preserves_screen_history_modes_and_ordered_replies() {
@@ -66,26 +51,6 @@ fn every_fixture_split_preserves_screen_history_modes_and_ordered_replies() {
     }
 }
 #[test]
-fn representative_redraws_replay_after_reflow_without_color_loss() {
-    for fixture in fixtures() {
-        let mut source = Terminal::new(48, 12);
-        source.feed(fixture.as_bytes());
-        let mut display = Terminal::new(48, 12);
-        let mut previous = None;
-        for (cols, rows) in [(48, 12), (120, 36), (24, 8), (80, 24)] {
-            source.resize(cols, rows);
-            display.resize(cols, rows);
-            let next = frame(source.snapshot());
-            for byte in terminal_diff(previous.as_ref(), &next) {
-                display.feed(&[byte]);
-            }
-            assert_eq!(display.snapshot().cells, next.cells);
-            assert_eq!(display.snapshot().cursor, next.cursor);
-            previous = Some(next);
-        }
-    }
-}
-#[test]
 fn fixture_semantics_cover_unicode_color_and_input_modes() {
     let fixture = fixtures().next().unwrap();
     let mut term = Terminal::new(48, 12);
@@ -104,17 +69,16 @@ fn long_running_output_evicts_old_history_and_caps_requests() {
     for n in 0..15_000 {
         term.feed(format!("synthetic-{n:05}\r\n").as_bytes());
     }
-    assert!(term.search("OLD_SENTINEL", 10).is_empty());
-    assert_eq!(term.search("synthetic-14999", 10).len(), 1);
+    assert!(term.web_search("OLD_SENTINEL", 10).0.is_empty());
+    assert_eq!(term.web_search("synthetic-14999", 10).0.len(), 1);
     let oldest = term.history(i32::MIN, usize::MAX);
     assert_eq!(oldest.len(), 1000);
     assert!(oldest[0].0 >= -10_000);
-    assert!(term.search("synthetic", usize::MAX).len() <= 256);
     term.feed(b"\x1b[?1049hsynthetic-alt");
-    assert_eq!(term.search("synthetic-14999", 10).len(), 1);
+    assert_eq!(term.web_search("synthetic-14999", 10).0.len(), 1);
     assert_eq!(term.history(i32::MIN, usize::MAX).len(), 1000);
     term.feed(b"\x1b[?1049l");
-    assert_eq!(term.search("synthetic-14999", 10).len(), 1);
+    assert_eq!(term.web_search("synthetic-14999", 10).0.len(), 1);
 }
 
 #[test]

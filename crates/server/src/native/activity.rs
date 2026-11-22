@@ -1,9 +1,5 @@
 //! Durable metadata notifications. One workspace server owns this file; no journal lock.
-use super::{
-    protocol::{Notification, PaneId, PaneInfo},
-    tracking,
-    ui::AgentFilter,
-};
+use super::protocol::{Notification, PaneId, PaneInfo};
 use crate::{
     Result, journal,
     model::{Kind, Status},
@@ -356,26 +352,7 @@ impl Activity {
     pub fn unread(&self) -> usize {
         self.data.events.iter().filter(|event| !event.read).count()
     }
-    pub fn next(&self, panes: &[PaneInfo], filter: AgentFilter, active: PaneId) -> Option<PaneId> {
-        next(panes, filter, active)
-    }
 }
-/// Cycle logical pane order, independent of view geometry, excluding ordinary shells.
-pub fn next(panes: &[PaneInfo], filter: AgentFilter, active: PaneId) -> Option<PaneId> {
-    let panes: Vec<_> = tracking::filtered(panes, filter)
-        .into_iter()
-        .filter(|pane| pane.kind.is_some())
-        .collect();
-    if panes.is_empty() {
-        return None;
-    }
-    let index = panes
-        .iter()
-        .position(|pane| pane.id == active)
-        .map_or(0, |index| (index + 1) % panes.len());
-    Some(panes[index].id)
-}
-
 /// A numeric pane ID alone can point at a different shell after a restart.
 pub fn matches(event: &Notification, pane: &PaneInfo, run: &str) -> bool {
     event.origin.as_ref().is_some_and(|origin| {

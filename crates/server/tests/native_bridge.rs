@@ -52,7 +52,28 @@ fn wait(child: &mut Child) -> std::process::ExitStatus {
         thread::sleep(Duration::from_millis(10));
     }
 }
+/// A same-user stream connection after its Hello/Welcome handshake.
+fn stream_peer(socket: &std::path::Path) -> UnixStream {
+    let mut s = UnixStream::connect(socket).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    write_message(
+        &mut s,
+        &ClientMessage::Stream(Request::Hello {
+            version: stream::VERSION,
+        }),
+    )
+    .unwrap();
+    while !matches!(next_event(&mut s), Event::Welcome { .. }) {}
+    s
+}
+fn next_event(s: &mut UnixStream) -> Event {
+    match read_message(s).unwrap().unwrap() {
+        ServerMessage::Stream(event) => event,
+        other => panic!("{other:?}"),
+    }
+}
 impl Server {
+    /// A server process with one shell pane (1), created by a stream client.
     fn start() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -82,6 +103,23 @@ impl Server {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
+        let mut seeder = stream_peer(&s.socket());
+        write_message(
+            &mut seeder,
+            &ClientMessage::Stream(Request::Spawn {
+                request: "seed".into(),
+                cwd: None,
+                argv: vec![],
+                shell: None,
+            }),
+        )
+        .unwrap();
+        loop {
+            if let Event::Spawned { pane, .. } = next_event(&mut seeder) {
+                assert_eq!(pane, 1);
+                break;
+            }
+        }
         s
     }
     fn socket(&self) -> PathBuf {
@@ -92,20 +130,38 @@ impl Server {
         c.arg(verb).arg("--socket").arg(self.socket());
         c
     }
+    /// Pane 1's metadata and screen, observed by a separate stream client.
     fn screen(&self) -> (PaneInfo, Screen) {
-        let mut s = UnixStream::connect(self.socket()).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        write_message(&mut s, &ClientMessage::InspectPane { pane: 1 }).unwrap();
-        match read_message(&mut s).unwrap().unwrap() {
-            ServerMessage::PaneState { pane, screen } => (pane, screen),
-            other => panic!("{other:?}"),
+        let mut s = stream_peer(&self.socket());
+        write_message(
+            &mut s,
+            &ClientMessage::Stream(Request::Subscribe { panes: vec![1] }),
+        )
+        .unwrap();
+        loop {
+            if let Event::Update(u) = next_event(&mut s) {
+                let screen = u.snapshots.into_iter().find(|p| p.pane == 1);
+                let pane = u.panes.into_iter().find(|p| p.id == 1);
+                if let (Some(pane), Some(snapshot)) = (pane, screen) {
+                    return (pane, snapshot.screen);
+                }
+            }
         }
     }
 }
 impl Drop for Server {
     fn drop(&mut self) {
         if let Ok(mut s) = UnixStream::connect(self.socket()) {
-            let _ = write_message(&mut s, &ClientMessage::Command(Action::Shutdown));
+            for request in [
+                Request::Hello {
+                    version: stream::VERSION,
+                },
+                Request::Shutdown {
+                    request: "drop".into(),
+                },
+            ] {
+                let _ = write_message(&mut s, &ClientMessage::Stream(request));
+            }
         }
         let until = Instant::now() + Duration::from_secs(3);
         while self.child.try_wait().unwrap().is_none() {
@@ -286,7 +342,9 @@ fn bridge_rejects_nonstream_truncated_oversized_and_wrong_handshake_without_shut
     let server = Server::start();
     let before = server.screen().0.pid;
     let mut command = Vec::new();
-    write_message(&mut command, &ClientMessage::Command(Action::Shutdown)).unwrap();
+    write_message(&mut command, &serde_json::json!({"Command": "Shutdown"})).unwrap();
+    let mut diagnostics = Vec::new();
+    write_message(&mut diagnostics, &ClientMessage::Diagnostics).unwrap();
     let mut wrong = Vec::new();
     write_message(
         &mut wrong,
@@ -295,6 +353,7 @@ fn bridge_rejects_nonstream_truncated_oversized_and_wrong_handshake_without_shut
     .unwrap();
     for bytes in [
         command,
+        diagnostics,
         wrong,
         vec![0, 0, 0, 20, b'{'],
         ((MAX_MESSAGE + 1) as u32).to_be_bytes().to_vec(),
@@ -311,28 +370,35 @@ fn bridge_rejects_nonstream_truncated_oversized_and_wrong_handshake_without_shut
 fn stream_inspection_is_read_only_and_reports_current_subscriptions() {
     let server = Server::start();
     let (before, screen) = server.screen();
-    let mut controller = UnixStream::connect(server.socket()).unwrap();
-    controller
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    write_message(
-        &mut controller,
-        &ClientMessage::Attach {
-            version: VERSION,
-            cols: 80,
-            rows: 24,
+    // Another stream client holds pane 1's lease at its own size.
+    let mut controller = stream_peer(&server.socket());
+    for request in [
+        Request::Subscribe { panes: vec![1] },
+        Request::Claim {
+            pane: 1,
             takeover: false,
         },
-    )
-    .unwrap();
+        Request::Resize {
+            pane: 1,
+            cols: 80,
+            rows: 24,
+        },
+    ] {
+        write_message(&mut controller, &ClientMessage::Stream(request)).unwrap();
+    }
     let owner = loop {
-        if let Some(ServerMessage::Welcome { client_id, .. }) =
-            read_message(&mut controller).unwrap()
-        {
-            break client_id;
+        if let Event::Update(u) = next_event(&mut controller) {
+            let sized = u
+                .snapshots
+                .iter()
+                .any(|p| p.pane == 1 && p.screen.cols == 80);
+            if let (Some(lease), true) = (u.leases.iter().find(|l| l.pane == 1), sized) {
+                break lease.owner;
+            }
         }
     };
     let geometry = server.screen().1;
+    assert_eq!(geometry.cols, 80);
     let mut child = server
         .command("stream-inspect")
         .arg("1")
@@ -357,17 +423,11 @@ fn stream_inspection_is_read_only_and_reports_current_subscriptions() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["subscribed"], serde_json::json!([1]));
     assert_eq!(json["screens"]["1"]["screen"]["cols"], geometry.cols);
-    assert!(json["leases"].as_array().unwrap().is_empty());
-    let mut inspect = UnixStream::connect(server.socket()).unwrap();
-    write_message(&mut inspect, &ClientMessage::Inspect).unwrap();
-    let Some(ServerMessage::State {
-        controller: Some(current),
-        ..
-    }) = read_message(&mut inspect).unwrap()
-    else {
-        panic!("missing controller")
-    };
-    assert_eq!(current, owner);
+    assert_eq!(
+        json["leases"],
+        serde_json::json!([{"pane": 1, "owner": owner}]),
+        "the inspector takes no lease"
+    );
     assert_eq!(server.screen().0.pid, before.pid);
     assert_eq!(server.screen().1.cols, geometry.cols);
     assert!(screen.cols > 0);
@@ -511,11 +571,7 @@ fn bridge_reports_a_workspace_that_speaks_only_legacy_tui_messages() {
         ));
         write_message(
             &mut socket,
-            &ServerMessage::Welcome {
-                version: VERSION,
-                client_id: 1,
-                controller: false,
-            },
+            &serde_json::json!({"Welcome": {"version": 58, "client_id": 1, "controller": false}}),
         )
         .unwrap();
     });

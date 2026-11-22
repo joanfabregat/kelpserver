@@ -1,5 +1,5 @@
 //! Explicit named workspaces and detached process ownership, without a service unit.
-use super::{protocol::*, ui::UiConfig};
+use super::{connection::Session, protocol::*};
 use crate::{Result, journal};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -40,67 +40,57 @@ pub fn private_state(state: &Path) -> Result<()> {
     journal::private_dir(state)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// The server's part of `workspace.json`: the shell and launch directory of
+/// panes created without their own. Clients may keep their own keys in the
+/// same file; the server ignores them and `start` preserves them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
-    pub tab_count: Option<usize>,
-    #[serde(skip_serializing)]
-    pub grid_weights: [Vec<u16>; 2],
-    pub template: Option<super::templates::Template>,
-    pub ui: UiConfig,
     pub shell: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
-    #[serde(skip_serializing)]
-    pub grid: (u8, u8),
 }
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            tab_count: None,
-            grid_weights: [Vec::new(), Vec::new()],
-            template: None,
-            ui: UiConfig::default(),
-            shell: None,
-            cwd: None,
-            grid: (1, 1),
-        }
+const MAX_SETTINGS: u64 = 64 * 1024;
+fn settings_bytes(path: &Path) -> Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_SETTINGS {
+        return Err("configuration must be a regular file smaller than 64 KiB".into());
     }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTINGS + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS {
+        return Err("configuration must be a regular file smaller than 64 KiB".into());
+    }
+    Ok(bytes)
 }
 impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
-        let meta = fs::symlink_metadata(path)?;
-        if !meta.is_file() || meta.len() > 64 * 1024 {
-            return Err("configuration must be a regular file smaller than 64 KiB".into());
-        }
-        let mut settings: Self = serde_json::from_slice(&fs::read(path)?)?;
-        if settings.tab_count.is_some_and(|count| count == 0) {
-            return Err("tab_count must be positive".into());
-        }
-        settings.ui.validate()?;
-        for (weights, count) in settings
-            .grid_weights
-            .iter()
-            .zip([settings.grid.0, settings.grid.1])
-        {
-            if !weights.is_empty()
-                && (weights.len() != usize::from(count)
-                    || weights.iter().any(|weight| *weight < 50 || *weight > 1000)
-                    || weights.iter().map(|weight| u32::from(*weight)).sum::<u32>() > 1000)
-            {
-                return Err("invalid persistent grid weights".into());
-            }
-        }
-        if let Some(template) = &settings.template {
-            template.validate_schema()?;
-        }
-        if settings.grid.0 == 0 || settings.grid.1 == 0 {
-            return Err("unsupported startup grid".into());
-        }
-        settings
-            .tab_count
-            .get_or_insert(usize::from(settings.grid.0) * usize::from(settings.grid.1));
-        Ok(settings)
+        Ok(serde_json::from_slice(&settings_bytes(path)?)?)
     }
+}
+/// Record the shell and launch directory in `workspace.json`, keeping every
+/// other key (a client's own settings) unchanged.
+fn persist_settings(path: &Path, shell: &Path, cwd: &Path) -> Result<()> {
+    let mut object = match settings_bytes(path) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes)? {
+            serde_json::Value::Object(object) => object,
+            _ => return Err("workspace.json must contain a JSON object".into()),
+        },
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            serde_json::Map::new()
+        }
+        Err(error) => return Err(error),
+    };
+    object.insert("shell".into(), serde_json::to_value(shell)?);
+    object.insert("cwd".into(), serde_json::to_value(cwd)?);
+    journal::atomic(path, &serde_json::Value::Object(object))
 }
 pub fn workspace_path(name: &str) -> Result<PathBuf> {
     if name.is_empty()
@@ -120,11 +110,6 @@ pub fn workspace_path(name: &str) -> Result<PathBuf> {
         .unwrap_or_else(|| home.join(".local/state"))
         .join("kelpmux/workspaces")
         .join(name))
-}
-pub fn inspect(socket: &Path) -> Result<ServerMessage> {
-    let mut stream = super::connection::connect(socket)?;
-    write_message(&mut stream, &ClientMessage::Inspect)?;
-    super::connection::response(&mut stream)
 }
 /// Called before any threads are created. The original process returns false;
 /// its session-independent grandchild continues with stdio redirected.
@@ -174,14 +159,15 @@ pub struct StartRequest<'a> {
     pub state: &'a Path,
     pub shell: &'a Path,
     pub cwd: &'a Path,
+    /// The base pane size.
     pub cols: u16,
     pub rows: u16,
-    pub settings: &'a Settings,
     pub replace_running: bool,
     pub executable: Option<&'a Path>,
-    /// Forwarded to the server; not persisted in `workspace.json`.
-    pub startup_panes: super::stream::StartupPanes,
 }
+/// Start the workspace server in the background unless it is already running.
+/// With `replace_running`, a running server of another executable is stopped
+/// first (its panes end). The new server starts without panes.
 pub fn start(request: StartRequest<'_>) -> Result<()> {
     private_state(request.state)?;
     // Serialize the entire readiness/configuration transaction. Locking only
@@ -222,16 +208,17 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
         return Err("selected server binary must be an executable regular file".into());
     }
     let mut previous = None;
-    if matches!(inspect(request.socket), Ok(ServerMessage::State { .. })) {
-        if !request.replace_running {
-            return Ok(());
+    if request.socket.try_exists()? {
+        if let Ok(session) = Session::open(request.socket) {
+            if !request.replace_running {
+                return Ok(());
+            }
+            let identity = super::upgrade::identify(&session.socket, request.state)?;
+            if identity.device == target.dev() && identity.inode == target.ino() {
+                return Ok(());
+            }
+            previous = Some(session);
         }
-        let stream = super::connection::connect(request.socket)?;
-        let identity = super::upgrade::identify(&stream, request.state)?;
-        if identity.device == target.dev() && identity.inode == target.ino() {
-            return Ok(());
-        }
-        previous = Some(stream);
     }
     // Fail obvious configuration mistakes before persisting or forking. The
     // server still handles races and relative shell names resolved through PATH.
@@ -244,19 +231,10 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
             return Err("workspace shell must be an executable file".into());
         }
     }
-    request.settings.ui.validate()?;
-    if let Some(template) = &request.settings.template {
-        template.validate()?;
-    }
-    if let Some(mut stream) = previous {
+    super::stream::validate_size(request.cols, request.rows)?;
+    if let Some(session) = previous {
         eprintln!("Updating workspace: ending the previous build's shells and jobs.");
-        write_message(&mut stream, &ClientMessage::Command(Action::Shutdown))?;
-        match super::connection::response(&mut stream)? {
-            ServerMessage::State { .. } => (),
-            ServerMessage::Error(error) => return Err(error.into()),
-            _ => return Err("previous server did not acknowledge shutdown".into()),
-        }
-        drop(stream);
+        shutdown(session, request.socket)?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if !request.socket.try_exists()? {
@@ -273,10 +251,8 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
             thread::sleep(Duration::from_millis(20));
         }
     }
-    let mut persisted = request.settings.clone();
-    persisted.shell = Some(request.shell.to_path_buf());
-    persisted.cwd = Some(request.cwd.to_path_buf());
-    journal::atomic(&request.state.join("workspace.json"), &persisted)?;
+    let config = request.state.join("workspace.json");
+    persist_settings(&config, request.shell, request.cwd)?;
     let size = format!("{}x{}", request.cols, request.rows);
     let mut command = Command::new(&executable);
     // The server and its panes start clean of the starter's agent and
@@ -296,14 +272,7 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
         .arg("--size")
         .arg(size)
         .arg("--config")
-        .arg(request.state.join("workspace.json"));
-    // Only a non-default policy is passed, so a selected older server binary
-    // without `--startup-panes` still starts with its default behavior.
-    if request.startup_panes != super::stream::StartupPanes::Layout {
-        command
-            .arg("--startup-panes")
-            .arg(request.startup_panes.as_str());
-    }
+        .arg(&config);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -311,7 +280,7 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
         .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if matches!(inspect(request.socket), Ok(ServerMessage::State { .. })) {
+        if Session::open(request.socket).is_ok() {
             let _ = child.wait();
             return Ok(());
         }
@@ -334,6 +303,41 @@ pub fn start(request: StartRequest<'_>) -> Result<()> {
             .into());
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+/// Ask a running server to stop. The server replies, then ends its panes and
+/// exits. Servers without `server-lifecycle` (before the stream session API)
+/// get the legacy shutdown command of the composed protocol.
+pub fn stop(socket: &Path) -> Result<()> {
+    shutdown(Session::open(socket)?, socket)
+}
+fn shutdown(mut session: Session, socket: &Path) -> Result<()> {
+    if session.has("server-lifecycle") {
+        let request = session.request_id();
+        return match session.request(super::stream::Request::Shutdown { request })? {
+            super::stream::Event::Done { .. } => Ok(()),
+            _ => Err("server did not acknowledge shutdown".into()),
+        };
+    }
+    drop(session);
+    // A stream peer may send only stream requests: use a new connection.
+    let mut legacy = super::connection::connect(socket)?;
+    write_message(&mut legacy, &serde_json::json!({"Command": "Shutdown"}))?;
+    let reply: serde_json::Value = {
+        let mut header = [0u8; 4];
+        legacy.read_exact(&mut header)?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 || length > MAX_MESSAGE {
+            return Err("invalid legacy server reply".into());
+        }
+        let mut bytes = vec![0; length];
+        legacy.read_exact(&mut bytes)?;
+        serde_json::from_slice(&bytes)?
+    };
+    match reply.get("Error").and_then(|error| error.as_str()) {
+        Some(error) => Err(error.to_owned().into()),
+        None if reply.get("State").is_some() => Ok(()),
+        None => Err("previous server did not acknowledge shutdown".into()),
     }
 }
 pub fn save_pid(state: &Path) -> Result<()> {
@@ -369,85 +373,4 @@ pub fn finish_run(state: &Path) -> Result<()> {
     fs::remove_file(state.join("server.running.json"))?;
     fs::File::open(state)?.sync_all()?;
     Ok(())
-}
-
-/// Read the private fold preference independently of retained-build settings.
-pub fn sidebar_folded(path: &Path) -> Result<bool> {
-    private_preference(path)
-}
-pub fn sidebar_accent(path: &Path) -> Result<super::ui::Accent> {
-    private_preference(path)
-}
-fn private_preference<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || metadata.len() > 128
-    {
-        return Err("sidebar preference must be an owned private file".into());
-    }
-    let mut text = String::new();
-    file.take(129).read_to_string(&mut text)?;
-    if text.len() > 128 {
-        return Err("sidebar preference is too large".into());
-    }
-    Ok(serde_json::from_str(&text)?)
-}
-
-/// Persist startup definitions in display order, never live process/session state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TabLayout {
-    pub template: Option<super::templates::Template>,
-    pub cwd: PathBuf,
-    pub shell: PathBuf,
-    pub panes: Vec<StartupPane>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartupPane {
-    pub name: Option<String>,
-    pub cwd: PathBuf,
-    pub shell: PathBuf,
-}
-impl TabLayout {
-    pub fn load(path: &Path) -> Result<Self> {
-        let meta = fs::symlink_metadata(path)?;
-        if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.mode() & 0o077 != 0
-            || meta.len() > 512 * 1024
-        {
-            return Err("tab layout must be an owned private file smaller than 512 KiB".into());
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        let mut bytes = vec![];
-        file.take(512 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 512 * 1024 {
-            return Err("saved tab layout is too large".into());
-        }
-        let layout: Self = serde_json::from_slice(&bytes)?;
-        if layout.panes.is_empty()
-            || layout.panes.iter().any(|pane| {
-                !pane.cwd.is_absolute()
-                    || pane.shell.as_os_str().is_empty()
-                    || pane.name.as_ref().is_some_and(|name| {
-                        name.trim().is_empty()
-                            || name.len() > 128
-                            || name.chars().any(char::is_control)
-                    })
-            })
-        {
-            return Err("invalid saved tab startup layout".into());
-        }
-        Ok(layout)
-    }
 }

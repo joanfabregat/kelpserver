@@ -1,4 +1,4 @@
-//! Session API on the stream protocol (KelpServer ADR 0002, step 1).
+//! Session API on the stream protocol (KelpServer ADR 0002, steps 1–3).
 use kelpserver::native::{
     protocol::*,
     server::{ServerConfig, serve},
@@ -16,16 +16,25 @@ use std::{
 struct Daemon {
     root: PathBuf,
     thread: Option<thread::JoinHandle<kelpserver::Result<()>>>,
+    /// The connection that created the two seeded panes.
+    seeder: Option<u64>,
 }
 impl Daemon {
+    /// A server with two panes (1 and 2), created by a seeding client.
     fn start() -> Self {
         Self::start_with(|_| {})
     }
     /// `prepare` may seed the private state directory before the server starts.
     fn start_with(prepare: impl FnOnce(&std::path::Path)) -> Self {
-        Self::start_policy(prepare, StartupPanes::Layout)
+        let mut daemon = Self::empty(prepare);
+        let mut seeder = daemon.peer();
+        assert_eq!(seeder.spawn("seed-1", &[]), 1);
+        assert_eq!(seeder.spawn("seed-2", &[]), 2);
+        daemon.seeder = Some(seeder.id);
+        daemon
     }
-    fn start_policy(prepare: impl FnOnce(&std::path::Path), startup_panes: StartupPanes) -> Self {
+    /// A server as it starts: without panes.
+    fn empty(prepare: impl FnOnce(&std::path::Path)) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "kelpserver-session-{}-{}",
@@ -38,23 +47,18 @@ impl Daemon {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         prepare(&state);
         let config = ServerConfig {
-            initial_weights: Default::default(),
-            template: None,
             socket: root.join("control.sock"),
             state_dir: state,
             shell: "/bin/sh".into(),
             cwd: root.clone(),
             cols: 100,
             rows: 30,
-            ui: Default::default(),
-            initial_grid: (2, 1),
-            initial_tabs: None,
-            startup_panes,
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {
             root,
             thread: Some(handle),
+            seeder: None,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while UnixStream::connect(daemon.root.join("control.sock")).is_err() {
@@ -103,13 +107,12 @@ impl Daemon {
         }
         p
     }
+    /// The pane's current screen, observed by a separate stream client.
     fn inspect(&self, pane: u64) -> Screen {
-        let mut s = self.socket();
-        write_message(&mut s, &ClientMessage::InspectPane { pane }).unwrap();
-        match read_message(&mut s).unwrap().unwrap() {
-            ServerMessage::PaneState { screen, .. } => screen,
-            other => panic!("{other:?}"),
-        }
+        let mut observer = self.peer();
+        observer.send(Request::Subscribe { panes: vec![pane] });
+        observer.screen_until(pane, |_| true);
+        observer.screens[&pane].screen.clone()
     }
     fn wait_stopped(&mut self) {
         let thread = self.thread.take().unwrap();
@@ -124,7 +127,16 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         if let Ok(mut s) = UnixStream::connect(self.root.join("control.sock")) {
-            let _ = write_message(&mut s, &ClientMessage::Command(Action::Shutdown));
+            for request in [
+                Request::Hello {
+                    version: stream::VERSION,
+                },
+                Request::Shutdown {
+                    request: "drop".into(),
+                },
+            ] {
+                let _ = write_message(&mut s, &ClientMessage::Stream(request));
+            }
         }
         if let Some(t) = self.thread.take() {
             assert!(t.join().unwrap().is_ok());
@@ -271,7 +283,7 @@ fn welcome_advertises_session_capabilities_and_server_version() {
         "notification-ack-all",
         "host-status",
         "server-lifecycle",
-        "pane-spawn",
+        "diagnostics",
     ] {
         assert!(
             peer.capabilities.iter().any(|c| c == capability),
@@ -656,25 +668,18 @@ fn a_leased_but_unsubscribed_pane_keeps_its_size() {
     peer.screen_until(1, |s| s.cols == 57 && s.rows == 19);
     peer.send(Request::Subscribe { panes: vec![] });
     peer.update_until(|u| u.subscribed.is_empty());
-    // A composed-protocol resize of the base geometry must not touch it.
-    let mut tui = daemon.socket();
-    write_message(
-        &mut tui,
-        &ClientMessage::Attach {
-            version: VERSION,
-            cols: 120,
-            rows: 40,
-            takeover: false,
-        },
-    )
-    .unwrap();
     thread::sleep(Duration::from_millis(300));
     let screen = daemon.inspect(1);
     assert_eq!((screen.cols, screen.rows), (57, 19));
+    // Releasing returns the pane to the server's base size (`--size`).
     peer.send(Request::Release { pane: 1 });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while daemon.inspect(1).cols == 57 {
-        assert!(Instant::now() < deadline);
+    loop {
+        let screen = daemon.inspect(1);
+        if (screen.cols, screen.rows) == (100, 30) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}x{}", screen.cols, screen.rows);
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -840,32 +845,6 @@ fn new_requests_require_hello() {
 // Step 2 server support (ADR 0002): startup policy, recovery signal, spawn
 // shell, unused-shell and spawned-by observations, limits, notification run.
 
-/// Attach the composed protocol and return its first full frame.
-fn composed_frame(daemon: &Daemon) -> (UnixStream, Frame) {
-    let mut tui = daemon.socket();
-    write_message(
-        &mut tui,
-        &ClientMessage::Attach {
-            version: VERSION,
-            cols: 120,
-            rows: 40,
-            takeover: false,
-        },
-    )
-    .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(Instant::now() < deadline, "no composed frame");
-        match read_message::<ServerMessage>(&mut tui)
-            .unwrap()
-            .expect("disconnected")
-        {
-            ServerMessage::Frame(frame) => return (tui, frame),
-            ServerMessage::Error(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-}
 fn private_file(path: &std::path::Path, contents: &[u8]) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -889,48 +868,42 @@ fn welcome_advertises_step2_capabilities_limits_and_notification_run() {
             "{capability}"
         );
     }
+    // Step 3 removed the composed administration request.
+    assert!(!peer.capabilities.iter().any(|c| c == "pane-spawn"));
     let (startup, recovery, limits, run) = peer.welcome_fields();
-    assert_eq!(startup, Some(StartupPanes::Layout));
+    assert_eq!(startup, Some(StartupPanes::None));
     assert!(!recovery, "a first run is clean");
     assert_eq!(limits, Some(stream::LIMITS));
     assert!(
         limits.is_some_and(|l| l.subscriptions >= 24),
         "a 24-pane grid fits"
     );
-    // It is the run the composed UI matches notification origins against.
-    let (_tui, frame) = composed_frame(&daemon);
-    assert!(!frame.ui.notification_run.is_empty());
-    assert_eq!(run.as_deref(), Some(frame.ui.notification_run.as_str()));
+    assert!(run.is_some_and(|run| !run.is_empty()));
     // A clean run omits the recovery field from the wire.
     let json = serde_json::to_value(peer.welcome.as_ref().unwrap()).unwrap();
     assert!(json.get("recovery_pending").is_none(), "{json}");
-    assert_eq!(json["startup_panes"], "layout");
+    assert_eq!(json["startup_panes"], "none");
 }
 
 #[test]
-fn startup_policy_parses_only_known_values() {
-    assert_eq!(
-        "layout".parse::<StartupPanes>().unwrap(),
-        StartupPanes::Layout
-    );
+fn startup_policy_parses_only_none() {
     assert_eq!("none".parse::<StartupPanes>().unwrap(), StartupPanes::None);
+    let error = "layout".parse::<StartupPanes>().unwrap_err().to_string();
+    assert!(error.contains("removed"), "{error}");
     assert!("zero".parse::<StartupPanes>().is_err());
-    assert_eq!(StartupPanes::default(), StartupPanes::Layout);
+    assert_eq!(StartupPanes::default(), StartupPanes::None);
 }
 
-/// With `none`, a stream client owns the initial layout: the server starts
-/// with no pane, stays usable, and leaves the composed UI's saved tab layout
-/// and tab count alone.
+/// The server starts with no pane and stays usable; a client creates its
+/// layout with `spawn`. Files a client keeps in the state directory, such as
+/// a saved layout or its own `workspace.json` keys, are left alone.
 #[test]
-fn startup_panes_none_starts_empty_and_keeps_the_saved_layout() {
-    let layout = br#"{"seeded":"composed tab layout"}"#;
-    let daemon = Daemon::start_policy(
-        |state| {
-            private_file(&state.join("tab-layout.json"), layout);
-            private_file(&state.join("workspace.json"), br#"{"tab_count":3}"#);
-        },
-        StartupPanes::None,
-    );
+fn a_server_starts_empty_and_leaves_client_files_alone() {
+    let layout = br#"{"seeded":"client tab layout"}"#;
+    let daemon = Daemon::empty(|state| {
+        private_file(&state.join("tab-layout.json"), layout);
+        private_file(&state.join("workspace.json"), br#"{"tab_count":3}"#);
+    });
     let state = daemon.root.join("state");
     let mut peer = daemon.peer();
     assert_eq!(peer.welcome_fields().0, Some(StartupPanes::None));
@@ -939,16 +912,12 @@ fn startup_panes_none_starts_empty_and_keeps_the_saved_layout() {
     let first = peer.update_until(|_| true);
     assert!(first.panes.is_empty(), "{:?}", first.panes);
     assert!(first.sessions.is_empty());
-    // The composed UI still renders an empty workspace without panicking.
-    let (tui, frame) = composed_frame(&daemon);
-    assert!(frame.panes.is_empty());
-    drop(tui);
 
     let a = peer.spawn("none-1", &[]);
     let b = peer.spawn("none-2", &[]);
     assert_eq!((a, b), (1, 2), "the client's panes are the first ones");
     peer.send(Request::Subscribe { panes: vec![a, b] });
-    peer.screen_until(b, |_| true);
+    peer.screen_until(b, |s| (s.cols, s.rows) == (100, 30));
     peer.send(Request::Close {
         request: "none-3".into(),
         pane: a,
@@ -957,39 +926,66 @@ fn startup_panes_none_starts_empty_and_keeps_the_saved_layout() {
     assert_eq!(fs::read(state.join("tab-layout.json")).unwrap(), layout);
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(state.join("workspace.json")).unwrap()).unwrap();
-    assert_eq!(settings["tab_count"], 3, "{settings}");
+    assert_eq!(settings, serde_json::json!({"tab_count": 3}));
 }
 
 #[test]
 fn recovery_signal_is_shared_and_dismissable() {
     let unclean =
         |state: &std::path::Path| private_file(&state.join("server.running.json"), b"true");
-
     // A stream client sees the signal and dismisses it for everyone.
     let daemon = Daemon::start_with(unclean);
     let mut peer = daemon.peer();
     assert!(peer.welcome_fields().1);
     let json = serde_json::to_value(peer.welcome.as_ref().unwrap()).unwrap();
     assert_eq!(json["recovery_pending"], true);
+    assert!(daemon.peer().welcome_fields().1, "shown to every client");
     peer.send(Request::DismissRecovery {
         request: "recovery-1".into(),
     });
     peer.until(|e| matches!(e, Event::Done { request } if request == "recovery-1").then_some(()));
     assert!(!daemon.peer().welcome_fields().1);
-    let (_tui, frame) = composed_frame(&daemon);
-    assert!(frame.ui.dialog.is_none(), "{:?}", frame.ui.dialog);
-    drop(daemon);
+}
 
-    // The composed UI's popup consumes the same signal.
-    let daemon = Daemon::start_with(unclean);
-    let (_tui, frame) = composed_frame(&daemon);
-    assert!(
-        frame
-            .ui
-            .dialog
-            .is_some_and(|d| d.kind == kelpserver::native::ui::DialogKind::Recovery)
-    );
-    assert!(!daemon.peer().welcome_fields().1);
+/// A record of the composed protocol 58 (removed in 0.3) gets a clear error
+/// instead of a silent disconnect or a hang, then the connection closes.
+#[test]
+fn composed_protocol_messages_get_a_clear_error() {
+    let daemon = Daemon::start();
+    let mut tui = daemon.socket();
+    write_message(
+        &mut tui,
+        &serde_json::json!({"Attach": {"version": 58, "cols": 120, "rows": 40, "takeover": false}}),
+    )
+    .unwrap();
+    match read_message::<ServerMessage>(&mut tui).unwrap() {
+        Some(ServerMessage::Error(error)) => {
+            assert!(error.contains("protocol 58"), "{error}");
+            assert!(error.contains("stream"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(read_message::<ServerMessage>(&mut tui).unwrap().is_none());
+    // Stream clients are unaffected.
+    daemon.peer();
+}
+
+#[test]
+fn diagnostics_are_a_stream_request() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    assert!(peer.capabilities.iter().any(|c| c == "diagnostics"));
+    peer.send(Request::Diagnostics {
+        request: "diag-1".into(),
+    });
+    let report = peer.until(|e| match e {
+        Event::Diagnostics { request, report } if request == "diag-1" => Some(report.clone()),
+        _ => None,
+    });
+    assert_eq!(report.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(report.protocol, stream::VERSION);
+    assert_eq!((report.cols, report.rows, report.panes), (100, 30, 2));
+    assert!(report.clients >= 1);
 }
 
 #[test]
@@ -1082,12 +1078,34 @@ fn sessions_record_the_spawning_connection() {
             .unwrap()
             .spawned_by
     };
-    assert_eq!(by(1), None, "startup panes have no creator");
+    assert_eq!(by(1), daemon.seeder);
     assert_eq!(by(mine), Some(peer.id));
     assert_eq!(by(theirs), Some(other.id));
-    let startup = update.sessions.iter().find(|s| s.pane == 1).unwrap();
-    let json = serde_json::to_value(startup).unwrap();
+}
+
+/// Closing the last pane first creates a replacement shell, which the server
+/// created itself: it has no creator, and the field is omitted.
+#[test]
+fn closing_the_last_pane_leaves_a_replacement_shell() {
+    let daemon = Daemon::empty(|_| {});
+    let mut peer = daemon.peer();
+    peer.send(Request::SessionEvents { enabled: true });
+    let pane = peer.spawn("last-1", &[]);
+    peer.send(Request::Close {
+        request: "last-2".into(),
+        pane,
+    });
+    let replacement = peer.until(|e| match e {
+        Event::PaneCreated { session } => Some(session.clone()),
+        _ => None,
+    });
+    peer.until(|e| matches!(e, Event::Done { request } if request == "last-2").then_some(()));
+    assert!(replacement.pane > pane);
+    assert_eq!(replacement.spawned_by, None);
+    let json = serde_json::to_value(&replacement).unwrap();
     assert!(json.get("spawned_by").is_none(), "{json}");
+    let update = peer.update_until(|u| u.panes.len() == 1);
+    assert_eq!(update.panes[0].id, replacement.pane);
 }
 
 #[test]
@@ -1114,10 +1132,10 @@ fn more_than_ten_panes_fit_the_advertised_subscription_limit() {
     assert!(message.contains("invalid pane subscriptions"), "{message}");
 }
 
-/// `kelpserver start --startup-panes none` forwards the policy to the
-/// background server it launches.
+/// `kelpserver start`, `status`, `diagnostics` and `stop` administer the
+/// server over the stream protocol. `--startup-panes none` stays accepted.
 #[test]
-fn start_forwards_the_startup_policy() {
+fn lifecycle_commands_use_the_stream_protocol() {
     let root =
         std::env::temp_dir().join(format!("kelpserver-session-start-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
@@ -1129,13 +1147,15 @@ fn start_forwards_the_startup_policy() {
             .arg(&state)
             .output()
             .unwrap();
-        assert!(
+        (
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     };
-    run(&[
+    let (ok, _, stderr) = run(&["start", "--startup-panes", "layout"]);
+    assert!(!ok && stderr.contains("removed"), "{stderr}");
+    let (ok, stdout, stderr) = run(&[
         "start",
         "--shell",
         "/bin/sh",
@@ -1144,6 +1164,13 @@ fn start_forwards_the_startup_policy() {
         "--startup-panes",
         "none",
     ]);
+    assert!(ok, "{stderr}");
+    let listed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(listed["panes"], serde_json::json!([]), "{stdout}");
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("workspace.json")).unwrap()).unwrap();
+    assert_eq!(settings["shell"], "/bin/sh");
+
     let mut socket = UnixStream::connect(state.join("control.sock")).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1160,12 +1187,27 @@ fn start_forwards_the_startup_policy() {
         other => panic!("{other:?}"),
     };
     drop(socket);
-    run(&["stop"]);
+    assert_eq!(startup, Some(StartupPanes::None));
+
+    let (ok, _, stderr) = run(&["status"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "server {} (stream protocol 1)",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{stderr}"
+    );
+    let (ok, stdout, stderr) = run(&["diagnostics"]);
+    assert!(ok, "{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    let (ok, _, stderr) = run(&["stop"]);
+    assert!(ok, "{stderr}");
     let deadline = Instant::now() + Duration::from_secs(10);
     while state.join("control.sock").exists() {
         assert!(Instant::now() < deadline, "server did not stop");
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(startup, Some(StartupPanes::None));
     let _ = fs::remove_dir_all(&root);
 }
